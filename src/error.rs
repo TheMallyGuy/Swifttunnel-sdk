@@ -17,6 +17,7 @@ pub const ERROR_NETWORK: i32 = -7;
 pub const ERROR_CONFIG: i32 = -8;
 pub const ERROR_SPLIT_TUNNEL: i32 = -9;
 pub const ERROR_VPN: i32 = -10;
+pub const ERROR_USER_BANNED: i32 = -11;
 
 // ── SdkError enum ───────────────────────────────────────────────────────────
 
@@ -54,6 +55,9 @@ pub enum SdkError {
 
     #[error("Storage error: {0}")]
     Storage(String),
+
+    #[error("Account banned: {0}")]
+    UserBanned(String),
 }
 
 impl SdkError {
@@ -71,6 +75,7 @@ impl SdkError {
             SdkError::NotConnected => ERROR_NOT_CONNECTED,
             SdkError::Internal(_) => ERROR_INTERNAL,
             SdkError::Storage(_) => ERROR_INTERNAL,
+            SdkError::UserBanned(_) => ERROR_USER_BANNED,
         }
     }
 }

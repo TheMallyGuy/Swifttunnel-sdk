@@ -12,6 +12,53 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_millis(10);
 const RELAY_SWITCH_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+// Relay control-frame types (must match the relay server protocol).
+const AUTH_HELLO_FRAME_TYPE: u8 = 0xA1;
+const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
+
+const AUTH_HANDSHAKE_TOTAL_TIMEOUT: Duration = Duration::from_millis(1500);
+const AUTH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const AUTH_HANDSHAKE_ATTEMPTS: usize = 4;
+
+/// Status returned by the relay in an auth-ack frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAuthAckStatus {
+    Ok = 0,
+    BadFormat = 1,
+    BadSignature = 2,
+    Expired = 3,
+    SidMismatch = 4,
+    ServerMismatch = 5,
+    AuthDisabled = 6,
+}
+
+impl RelayAuthAckStatus {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Ok),
+            1 => Some(Self::BadFormat),
+            2 => Some(Self::BadSignature),
+            3 => Some(Self::Expired),
+            4 => Some(Self::SidMismatch),
+            5 => Some(Self::ServerMismatch),
+            6 => Some(Self::AuthDisabled),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::BadFormat => "bad_format",
+            Self::BadSignature => "bad_signature",
+            Self::Expired => "expired",
+            Self::SidMismatch => "sid_mismatch",
+            Self::ServerMismatch => "server_mismatch",
+            Self::AuthDisabled => "auth_disabled",
+        }
+    }
+}
+
 pub struct UdpRelay {
     socket: UdpSocket,
     relay_addr: ArcSwap<SocketAddr>,
@@ -242,6 +289,110 @@ impl UdpRelay {
 
     pub fn session_id_bytes(&self) -> &[u8; SESSION_ID_LEN] {
         &self.session_id
+    }
+
+    /// Lowercase hex of the session id, as expected by `/api/vpn/relay-ticket`.
+    pub fn session_id_hex(&self) -> String {
+        format!("{:016x}", self.session_id_u64())
+    }
+
+    /// Send a relay auth-hello frame: [session_id:8][0xA1][token_len:2][token_utf8].
+    fn send_auth_hello(&self, token: &str) -> Result<(), crate::error::SdkError> {
+        let token_bytes = token.as_bytes();
+        if token_bytes.is_empty() || token_bytes.len() > u16::MAX as usize {
+            return Err(crate::error::SdkError::Vpn(format!(
+                "Relay auth token length must be between 1 and {} bytes",
+                u16::MAX
+            )));
+        }
+
+        let mut frame = Vec::with_capacity(SESSION_ID_LEN + 3 + token_bytes.len());
+        frame.extend_from_slice(&self.session_id);
+        frame.push(AUTH_HELLO_FRAME_TYPE);
+        frame.extend_from_slice(&(token_bytes.len() as u16).to_be_bytes());
+        frame.extend_from_slice(token_bytes);
+
+        let current_addr = **self.relay_addr.load();
+        self.socket.send_to(&frame, current_addr).map_err(|e| {
+            crate::error::SdkError::Vpn(format!("Failed to send relay auth hello: {}", e))
+        })?;
+        log::debug!(
+            "UDP Relay: Sent auth hello to {} (session {:016x}, token {} bytes)",
+            current_addr,
+            self.session_id_u64(),
+            token_bytes.len()
+        );
+        Ok(())
+    }
+
+    fn wait_for_auth_ack(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<RelayAuthAckStatus>, crate::error::SdkError> {
+        let deadline = Instant::now() + timeout;
+        let mut recv_buf = [0u8; 1600];
+        let expected_addr = **self.relay_addr.load();
+
+        while Instant::now() < deadline {
+            match self.socket.recv_from(&mut recv_buf) {
+                Ok((len, from)) => {
+                    if from != expected_addr {
+                        continue;
+                    }
+                    if len < SESSION_ID_LEN + 2 {
+                        continue;
+                    }
+                    if recv_buf[..SESSION_ID_LEN] != self.session_id {
+                        continue;
+                    }
+                    if recv_buf[SESSION_ID_LEN] != AUTH_ACK_FRAME_TYPE {
+                        continue;
+                    }
+                    let status = RelayAuthAckStatus::from_u8(recv_buf[SESSION_ID_LEN + 1])
+                        .unwrap_or(RelayAuthAckStatus::BadFormat);
+                    return Ok(Some(status));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(e) => return Err(crate::error::SdkError::Vpn(e.to_string())),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send the relay auth-hello and wait for an ack.
+    ///
+    /// Retries up to [`AUTH_HANDSHAKE_ATTEMPTS`] times within a total
+    /// [`AUTH_HANDSHAKE_TOTAL_TIMEOUT`] budget. Returns `Ok(None)` on timeout.
+    pub fn authenticate_with_ticket(
+        &self,
+        token: &str,
+    ) -> Result<Option<RelayAuthAckStatus>, crate::error::SdkError> {
+        let deadline = Instant::now() + AUTH_HANDSHAKE_TOTAL_TIMEOUT;
+
+        for attempt in 0..AUTH_HANDSHAKE_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(AUTH_HANDSHAKE_RETRY_DELAY);
+            }
+
+            self.send_auth_hello(token)?;
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            if let Some(status) = self.wait_for_auth_ack(remaining)? {
+                log::info!(
+                    "UDP Relay: Auth ack {} for session {:016x}",
+                    status.as_str(),
+                    self.session_id_u64()
+                );
+                return Ok(Some(status));
+            }
+        }
+
+        Ok(None)
     }
 }
 

@@ -19,6 +19,10 @@ use super::process_tracker::{ConnectionKey, Protocol, TrackerStats};
 // GAME SERVER IP RANGES (for speculative tunneling)
 // ============================================================================
 
+/// DNS port. Never tunneled even for tunnel apps — DNS must resolve locally
+/// (and Route Assist repairs Roblox DNS via the hosts file instead).
+pub(crate) const DNS_PORT: u16 = 53;
+
 /// Roblox game server IP ranges - Complete list from AS22697/AS11281
 const ROBLOX_RANGES: &[(u32, u32, u32)] = &[
     // PRIMARY GAME SERVERS - covers ALL regional game servers
@@ -78,14 +82,29 @@ fn ip_in_range(ip: Ipv4Addr, network: u32, mask: u32) -> bool {
     (ip_u32 & mask) == (network & mask)
 }
 
-/// Check if destination is a Roblox game server
+/// Check if destination is a Roblox game server.
+///
+/// UDP is always eligible (game traffic). TCP is eligible only when Route Assist
+/// (`api_tunneling`) is enabled — that routes Roblox's API/bootstrap HTTPS to the
+/// relay so a banned/blocked network can still reach Roblox.
 #[inline(always)]
-pub fn is_roblox_game_server(dst_ip: Ipv4Addr, dst_port: u16, protocol: Protocol) -> bool {
-    if protocol != Protocol::Udp {
+pub fn is_roblox_game_server(
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    protocol: Protocol,
+    api_tunneling: bool,
+) -> bool {
+    if dst_port == DNS_PORT {
         return false;
     }
-    if dst_port < ROBLOX_PORT_MIN || dst_port > ROBLOX_PORT_MAX {
-        return false;
+    match protocol {
+        Protocol::Udp => {
+            if dst_port < ROBLOX_PORT_MIN || dst_port > ROBLOX_PORT_MAX {
+                return false;
+            }
+        }
+        Protocol::Tcp if api_tunneling => {}
+        _ => return false,
     }
     for &(network, mask, _prefix) in ROBLOX_RANGES {
         if ip_in_range(dst_ip, network, mask) {
@@ -100,14 +119,26 @@ pub fn is_roblox_game_server(dst_ip: Ipv4Addr, dst_port: u16, protocol: Protocol
 /// When we KNOW the packet is from a tunnel app, trust the process and
 /// tunnel ALL its UDP traffic (game server, STUN, voice chat, etc.).
 #[inline(always)]
-pub fn is_likely_game_traffic(_dst_port: u16, protocol: Protocol) -> bool {
-    protocol == Protocol::Udp
+pub fn is_likely_game_traffic(dst_port: u16, protocol: Protocol, api_tunneling: bool) -> bool {
+    if dst_port == DNS_PORT {
+        return false;
+    }
+    match protocol {
+        Protocol::Udp => true,
+        // Route Assist: trust a known tunnel app's TCP (API/bootstrap) traffic too.
+        Protocol::Tcp => api_tunneling,
+    }
 }
 
 /// Check if destination is any known game server
 #[inline(always)]
-pub fn is_game_server(dst_ip: Ipv4Addr, dst_port: u16, protocol: Protocol) -> bool {
-    is_roblox_game_server(dst_ip, dst_port, protocol)
+pub fn is_game_server(
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    protocol: Protocol,
+    api_tunneling: bool,
+) -> bool {
+    is_roblox_game_server(dst_ip, dst_port, protocol, api_tunneling)
 }
 
 /// Check if an IP is a Roblox game server (any port/protocol)
@@ -165,6 +196,10 @@ pub struct ProcessSnapshot {
     pub pid_names: HashMap<u32, String>,
     /// Apps that should be tunneled (lowercase)
     pub tunnel_apps: HashSet<String>,
+    /// Local UDP ports owned by a tunnel-app PID. Used as a port-only fallback
+    /// when the exact (ip, port, proto) connection lookup misses because the
+    /// packet's local IP representation drifted (e.g. 0.0.0.0 bind vs LAN IP).
+    pub tunnel_udp_ports: HashSet<u16>,
     /// Snapshot version (monotonically increasing)
     pub version: u64,
     /// Timestamp when snapshot was created
@@ -178,9 +213,56 @@ impl ProcessSnapshot {
             connections: HashMap::new(),
             pid_names: HashMap::new(),
             tunnel_apps,
+            tunnel_udp_ports: HashSet::new(),
             version: 0,
             created_at: std::time::Instant::now(),
         }
+    }
+
+    /// Compute the set of local UDP ports owned by a tunnel-app PID from a
+    /// connection map and pid->name map.
+    pub fn compute_tunnel_udp_ports(
+        connections: &HashMap<ConnectionKey, u32>,
+        pid_names: &HashMap<u32, String>,
+        tunnel_apps: &HashSet<String>,
+    ) -> HashSet<u16> {
+        let mut ports = HashSet::new();
+        for (key, &pid) in connections {
+            if key.protocol != Protocol::Udp {
+                continue;
+            }
+            if Self::pid_is_tunnel(pid, pid_names, tunnel_apps) {
+                ports.insert(key.local_port);
+            }
+        }
+        ports
+    }
+
+    /// PID -> tunnel-app check usable without a `ProcessSnapshot` instance.
+    fn pid_is_tunnel(
+        pid: u32,
+        pid_names: &HashMap<u32, String>,
+        tunnel_apps: &HashSet<String>,
+    ) -> bool {
+        if let Some(name) = pid_names.get(&pid) {
+            if tunnel_apps.contains(name) {
+                return true;
+            }
+            let name_stem = name.trim_end_matches(".exe");
+            for app in tunnel_apps {
+                let app_stem = app.trim_end_matches(".exe");
+                if name_stem.contains(app_stem) || app_stem.contains(name_stem) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Port-only fallback: is this local UDP port owned by a tunnel app?
+    #[inline(always)]
+    pub fn should_tunnel_by_port_fallback(&self, local_port: u16, protocol: Protocol) -> bool {
+        protocol == Protocol::Udp && self.tunnel_udp_ports.contains(&local_port)
     }
 
     /// Check if connection should be tunneled (V3 mode, no locks!)
@@ -196,15 +278,16 @@ impl ProcessSnapshot {
         protocol: Protocol,
         dst_ip: Ipv4Addr,
         dst_port: u16,
+        api_tunneling: bool,
     ) -> bool {
         let is_tunnel_app = self.is_tunnel_connection(local_ip, local_port, protocol);
 
         if is_tunnel_app {
-            return is_likely_game_traffic(dst_port, protocol);
+            return is_likely_game_traffic(dst_port, protocol, api_tunneling);
         }
 
         // Process not detected - use strict IP range check for speculative tunneling
-        is_game_server(dst_ip, dst_port, protocol)
+        is_game_server(dst_ip, dst_port, protocol, api_tunneling)
     }
 
     /// Check if connection belongs to a tunnel app
@@ -317,10 +400,17 @@ impl LockFreeProcessCache {
             .map(|(k, v)| (k, v.to_lowercase()))
             .collect();
 
+        let tunnel_udp_ports = ProcessSnapshot::compute_tunnel_udp_ports(
+            &connections,
+            &pid_names_lower,
+            &self.tunnel_apps,
+        );
+
         let new_snapshot = Arc::new(ProcessSnapshot {
             connections,
             pid_names: pid_names_lower,
             tunnel_apps: self.tunnel_apps.clone(),
+            tunnel_udp_ports,
             version,
             created_at: std::time::Instant::now(),
         });
@@ -335,10 +425,17 @@ impl LockFreeProcessCache {
         let old_snap = self.get_snapshot();
         let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
 
+        let tunnel_udp_ports = ProcessSnapshot::compute_tunnel_udp_ports(
+            &old_snap.connections,
+            &old_snap.pid_names,
+            &self.tunnel_apps,
+        );
+
         let new_snapshot = Arc::new(ProcessSnapshot {
             connections: old_snap.connections.clone(),
             pid_names: old_snap.pid_names.clone(),
             tunnel_apps: self.tunnel_apps.clone(),
+            tunnel_udp_ports,
             version,
             created_at: std::time::Instant::now(),
         });
@@ -365,10 +462,17 @@ impl LockFreeProcessCache {
         let mut pid_names = old_snap.pid_names.clone();
         pid_names.insert(pid, name.to_lowercase());
 
+        let tunnel_udp_ports = ProcessSnapshot::compute_tunnel_udp_ports(
+            &old_snap.connections,
+            &pid_names,
+            &self.tunnel_apps,
+        );
+
         let new_snapshot = Arc::new(ProcessSnapshot {
             connections: old_snap.connections.clone(),
             pid_names,
             tunnel_apps: self.tunnel_apps.clone(),
+            tunnel_udp_ports,
             version,
             created_at: std::time::Instant::now(),
         });
@@ -426,7 +530,7 @@ mod tests {
         // Should match via 0.0.0.0 fallback
         assert!(snap.should_tunnel_v3(
             Ipv4Addr::new(192, 168, 1, 100), 50000, Protocol::Udp,
-            Ipv4Addr::new(128, 116, 50, 100), 55000
+            Ipv4Addr::new(128, 116, 50, 100), 55000, false
         ));
     }
 
@@ -439,13 +543,13 @@ mod tests {
         // No process detected, but destination is a known game server -> speculative tunnel
         assert!(snap.should_tunnel_v3(
             Ipv4Addr::new(192, 168, 1, 100), 50000, Protocol::Udp,
-            Ipv4Addr::new(128, 116, 50, 100), 55000
+            Ipv4Addr::new(128, 116, 50, 100), 55000, false
         ));
 
         // Non-game destination -> bypass
         assert!(!snap.should_tunnel_v3(
             Ipv4Addr::new(192, 168, 1, 100), 50000, Protocol::Udp,
-            Ipv4Addr::new(1, 1, 1, 1), 443
+            Ipv4Addr::new(1, 1, 1, 1), 443, false
         ));
     }
 

@@ -212,6 +212,8 @@ pub struct ParallelInterceptor {
     refresh_now_flag: Arc<AtomicBool>,
     /// Auto-router for dynamic relay switching and whitelist bypass.
     auto_router: Option<Arc<crate::vpn::auto_routing::AutoRouter>>,
+    /// Route Assist: tunnel Roblox TCP API/bootstrap traffic too (not just UDP).
+    api_tunneling_enabled: Arc<AtomicBool>,
 }
 
 impl ParallelInterceptor {
@@ -252,7 +254,15 @@ impl ParallelInterceptor {
             inbound_receiver_handle: None,
             refresh_now_flag: Arc::new(AtomicBool::new(false)),
             auto_router: None,
+            api_tunneling_enabled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Enable or disable Route Assist (TCP API/bootstrap tunneling). Cheap to
+    /// toggle at runtime; workers read it per-batch.
+    pub fn set_api_tunneling_enabled(&self, enabled: bool) {
+        self.api_tunneling_enabled.store(enabled, Ordering::Relaxed);
+        log::info!("Route Assist (TCP API tunneling) set to {}", enabled);
     }
 
     /// Trigger immediate cache refresh (call when ETW detects game process)
@@ -818,6 +828,7 @@ impl ParallelInterceptor {
             let throughput = self.throughput_stats.clone();
             let relay_ctx = self.relay_ctx.clone();
             let auto_router = self.auto_router.clone();
+            let api_tunneling_enabled = Arc::clone(&self.api_tunneling_enabled);
 
             let handle = thread::spawn(move || {
                 set_thread_affinity(worker_id);
@@ -830,6 +841,7 @@ impl ParallelInterceptor {
                     stop_flag,
                     relay_ctx,
                     auto_router,
+                    api_tunneling_enabled,
                 );
             });
 
@@ -1113,6 +1125,7 @@ fn run_packet_worker(
     stop_flag: Arc<AtomicBool>,
     relay_ctx: Option<Arc<RelayForwardContext>>,
     auto_router: Option<Arc<crate::vpn::auto_routing::AutoRouter>>,
+    api_tunneling_enabled: Arc<AtomicBool>,
 ) {
     log::info!("Worker {} started", worker_id);
 
@@ -1178,9 +1191,29 @@ fn run_packet_worker(
         let packet_len = work.data.len() as u64;
 
         if work.is_outbound {
-            let should_tunnel = should_route_to_relay(&work.data, &snapshot, &mut inline_cache);
+            let api_tunneling = api_tunneling_enabled.load(Ordering::Relaxed);
+            let should_tunnel =
+                should_route_to_relay(&work.data, &snapshot, &mut inline_cache, api_tunneling);
             let auto_routing_bypass =
                 should_tunnel && auto_router.as_ref().map_or(false, |r| r.is_bypassed());
+
+            // Log tunnel decisions periodically so we can see what's happening
+            {
+                let count = stats.packets_processed.load(Ordering::Relaxed);
+                if count % 500 == 1 {
+                    log::info!(
+                        "interceptor: processed={} tunneled={} bypassed={} snapshot_pids={} tunnel_apps={:?}",
+                        count,
+                        stats.packets_tunneled.load(Ordering::Relaxed),
+                        stats.packets_bypassed.load(Ordering::Relaxed),
+                        snapshot.pid_names.len(),
+                        snapshot.tunnel_apps.iter().take(3).collect::<Vec<_>>()
+                    );
+                }
+                if should_tunnel && count % 100 == 1 {
+                    log::debug!("interceptor: pkt → tunnel (bypass={})", auto_routing_bypass);
+                }
+            }
 
             if auto_routing_bypass && work.data.len() >= 14 + 20 {
                 let ip_start = 14;
@@ -1444,33 +1477,58 @@ fn run_cache_refresher(
             }
         }
 
-        // Process name lookup (every 10th iteration: full scan, otherwise: fast path)
+        // Resolve process names for every PID that owns a connection.
+        #[cfg(windows)]
+        {
+            for &pid in connections.values() {
+                if !pid_names.contains_key(&pid) {
+                    if let Some(name) = get_process_name_by_pid(pid) {
+                        pid_names.insert(pid, name);
+                    }
+                }
+            }
+        }
+
+        // Every 10th iteration, do a full process enumeration so we discover the
+        // tunnel app's PID even when none of its sockets are in the owner tables
+        // yet. This is what lets `tunnel_udp_ports` and `is_tunnel_pid` match the
+        // app's game sockets the instant they appear. (Matches the desktop app's
+        // sysinfo full scan.)
         let do_full_process_scan = refresh_count % 10 == 0;
         let tunnel_apps = cache.tunnel_apps();
 
         if do_full_process_scan {
-            // Get process names for all PIDs using Windows API
-            #[cfg(windows)]
-            {
-                for &pid in connections.values() {
-                    if !pid_names.contains_key(&pid) {
-                        if let Some(name) = get_process_name_by_pid(pid) {
-                            pid_names.insert(pid, name);
-                        }
-                    }
+            for (pid, name) in enumerate_all_processes() {
+                let stem = name.trim_end_matches(".exe");
+                let is_tunnel = tunnel_apps.contains(&name)
+                    || tunnel_apps.iter().any(|app| {
+                        let app_stem = app.trim_end_matches(".exe");
+                        stem.contains(app_stem) || app_stem.contains(stem)
+                    });
+                if is_tunnel {
+                    pid_names.entry(pid).or_insert(name);
                 }
             }
-        } else {
-            // Fast path: only look up known connection PIDs
-            #[cfg(windows)]
-            {
-                for &pid in connections.values() {
-                    if !pid_names.contains_key(&pid) {
-                        if let Some(name) = get_process_name_by_pid(pid) {
-                            pid_names.insert(pid, name);
-                        }
-                    }
-                }
+        }
+
+        // Log tunnel app visibility every 10 refreshes to avoid spam
+        if refresh_count % 10 == 0 {
+            let tunnel_apps = cache.tunnel_apps();
+            let matched: Vec<_> = pid_names.values()
+                .map(|n| n.to_lowercase())
+                .filter(|n| tunnel_apps.contains(n.as_str()))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let udp_ports = ProcessSnapshot::compute_tunnel_udp_ports(&connections, &pid_names, &tunnel_apps);
+            if !matched.is_empty() {
+                log::info!(
+                    "cache refresh #{}: tunnel apps active: {:?} (tunnel_udp_ports={})",
+                    refresh_count, matched, udp_ports.len()
+                );
+            } else {
+                log::info!("cache refresh #{}: no tunnel apps in table (connections={} pids={})",
+                    refresh_count, connections.len(), pid_names.len());
             }
         }
 
@@ -1528,6 +1586,58 @@ fn get_process_name_by_pid(pid: u32) -> Option<String> {
     }
 }
 
+/// Enumerate all running processes as (pid, lowercase exe name).
+///
+/// Mirrors the desktop app's full `sysinfo` process scan: we must find the
+/// tunnel app's PID even when it has no entry in the TCP/UDP owner tables yet,
+/// otherwise `tunnel_udp_ports`/`is_tunnel_pid` can never match its sockets.
+#[cfg(windows)]
+fn enumerate_all_processes() -> Vec<(u32, String)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut out = Vec::new();
+    unsafe {
+        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return out,
+        };
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+                if !name.is_empty() {
+                    out.push((entry.th32ProcessID, name));
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = CloseHandle(snapshot);
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn enumerate_all_processes() -> Vec<(u32, String)> {
+    Vec::new()
+}
+
 /// Parse ports from Ethernet frame (returns src_port, dst_port)
 #[inline(always)]
 fn parse_ports(data: &[u8]) -> Option<(u16, u16)> {
@@ -1567,6 +1677,7 @@ fn should_route_to_relay(
     data: &[u8],
     snapshot: &ProcessSnapshot,
     inline_cache: &mut HashMap<(Ipv4Addr, u16, Protocol), bool>,
+    api_tunneling: bool,
 ) -> bool {
     if data.len() < 14 + 20 + 4 {
         return false;
@@ -1612,24 +1723,102 @@ fn should_route_to_relay(
     let src_port = u16::from_be_bytes([data[transport_start], data[transport_start + 1]]);
     let dst_port = u16::from_be_bytes([data[transport_start + 2], data[transport_start + 3]]);
 
-    // Phase 1: Check snapshot cache (fast path)
-    if snapshot.should_tunnel_v3(src_ip, src_port, protocol, dst_ip, dst_port) {
+    // Initial TCP SYN detection (used for Route Assist TCP bootstrap).
+    let tcp_flags = if protocol == Protocol::Tcp && data.len() > transport_start + 13 {
+        Some(data[transport_start + 13])
+    } else {
+        None
+    };
+    let is_tcp_initial_syn =
+        tcp_flags.is_some_and(|flags| (flags & 0x02) != 0 && (flags & 0x10) == 0);
+
+    // Phase 1: Check snapshot cache (fast path) - process-ownership based.
+    if snapshot.should_tunnel_v3(src_ip, src_port, protocol, dst_ip, dst_port, api_tunneling) {
+        let cache_key = (src_ip, src_port, protocol);
+        if inline_cache.len() < 10000 {
+            inline_cache.insert(cache_key, true);
+        }
         return true;
     }
 
-    // Phase 2: Check per-worker inline cache (only stores TRUE results)
+    // Phase 2: Per-worker inline cache (only stores TRUE results, like the app).
+    // Finding the key means this source flow was already classified as tunnel.
     let cache_key = (src_ip, src_port, protocol);
     if inline_cache.contains_key(&cache_key) {
-        return is_likely_game_traffic(dst_port, protocol);
+        return is_likely_game_traffic(dst_port, protocol, api_tunneling);
     }
 
-    // Phase 3: Speculative tunneling based on destination IP
-    // V3 skips expensive syscalls - relies on speculative tunneling
-    if is_game_server(dst_ip, dst_port, protocol) {
+    // Phase 3: Port-only fallback for tunnel-owned UDP ports. Recovers routing
+    // when the exact (ip, port) lookup missed due to local-IP representation
+    // drift (0.0.0.0 bind vs LAN IP). UDP only.
+    if snapshot.should_tunnel_by_port_fallback(src_port, protocol) {
+        if inline_cache.len() < 10000 {
+            inline_cache.insert(cache_key, true);
+        }
+        return is_likely_game_traffic(dst_port, protocol, api_tunneling);
+    }
+
+    // Phase 4: Speculative tunneling based on destination IP. Catches the
+    // first packets of a game flow before the owner table is populated.
+    if is_game_server(dst_ip, dst_port, protocol, api_tunneling) {
+        log_speculative_tunnel(src_ip, src_port, dst_ip, dst_port);
+        if inline_cache.len() < 10000 {
+            inline_cache.insert(cache_key, true);
+        }
         return true;
+    }
+
+    // Phase 5: Route Assist TCP bootstrap. With Route Assist enabled, tunnel the
+    // initial SYN of a Roblox HTTPS/API connection (port 80/443) to a repaired
+    // bootstrap IP, so account/launch/teleport flows ride the relay even on a
+    // banned/blocked network. Only fires when a tunnel app is actually present.
+    if api_tunneling
+        && protocol == Protocol::Tcp
+        && is_tcp_initial_syn
+        && matches!(dst_port, 80 | 443)
+        && !snapshot.tunnel_apps.is_empty()
+        && crate::roblox_proxy::hosts::is_active_bootstrap_ip(dst_ip)
+    {
+        log_speculative_tunnel(src_ip, src_port, dst_ip, dst_port);
+        if inline_cache.len() < 10000 {
+            inline_cache.insert(cache_key, true);
+        }
+        return true;
+    }
+
+    // Diagnostic: sample UDP packets in the game ephemeral-port range that we are
+    // about to bypass, so we can see whether game traffic is reaching the worker
+    // and why it isn't matching (dst not in ROBLOX_RANGES, etc.).
+    if protocol == Protocol::Udp && (49152..=65535).contains(&dst_port) {
+        log_bypassed_game_candidate(src_ip, src_port, dst_ip, dst_port);
     }
 
     false
+}
+
+/// Log the first few speculative-tunnel decisions (per process).
+fn log_speculative_tunnel(src_ip: Ipv4Addr, src_port: u16, dst_ip: Ipv4Addr, dst_port: u16) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 20 {
+        log::info!(
+            "SPECULATIVE TUNNEL: {}:{} -> {}:{} (PID unknown, destination is a game server)",
+            src_ip, src_port, dst_ip, dst_port
+        );
+    }
+}
+
+/// Sample-log UDP packets in the game port range that get bypassed, so we can
+/// confirm whether in-game traffic is being seen and why it doesn't match.
+fn log_bypassed_game_candidate(src_ip: Ipv4Addr, src_port: u16, dst_ip: Ipv4Addr, dst_port: u16) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n % 200 == 0 {
+        log::info!(
+            "BYPASS UDP candidate #{}: {}:{} -> {}:{} (not owned by tunnel app, dst not in ROBLOX_RANGES)",
+            n, src_ip, src_port, dst_ip, dst_port
+        );
+    }
 }
 
 /// V3 Inbound receiver thread - reads unencrypted packets from UDP relay,

@@ -37,6 +37,8 @@
 
 #define ERROR_VPN -10
 
+#define ERROR_USER_BANNED -11
+
 /**
  * Initialise the SDK: create runtime, logger, and global state.
  * Returns 0 on success, negative on error.
@@ -99,7 +101,7 @@ int32_t swifttunnel_auth_is_logged_in(void);
  * Get user info as JSON.  Returns null if not logged in.
  * Caller must free the returned string.
  *
- * JSON shape: `{"id":"...","email":"..."}`
+ * JSON shape: `{"id":"...","email":"...","is_tester":false,"is_banned":false,"banned_reason":null,"banned_at":null}`
  */
 char *swifttunnel_auth_get_user_json(void);
 

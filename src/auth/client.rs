@@ -1,6 +1,6 @@
 //! HTTP client for SwiftTunnel API
 
-use super::types::{ExchangeTokenResponse, SupabaseAuthResponse, VpnConfig};
+use super::types::{ExchangeTokenResponse, RelayTicketResponse, SupabaseAuthResponse, VpnConfig};
 use crate::error::SdkError;
 use log::{debug, error, info};
 use reqwest::Client;
@@ -150,6 +150,58 @@ impl AuthClient {
             .map_err(|e| SdkError::Auth(format!("Failed to parse config: {}", e)))?;
 
         info!("Got VPN config for region {}", region);
+        Ok(data)
+    }
+
+    /// Fetch a V3 relay ticket used to authenticate the UDP relay session.
+    ///
+    /// The relay server requires this handshake before it will forward packets,
+    /// so this must succeed (or report `auth_required = false`) for tunneling to work.
+    pub async fn get_relay_ticket(
+        &self,
+        access_token: &str,
+        server_region: &str,
+        session_id: &str,
+    ) -> Result<RelayTicketResponse, SdkError> {
+        let url = format!("{}/api/vpn/relay-ticket", API_BASE_URL);
+
+        debug!(
+            "Fetching relay ticket for region {} session {}",
+            server_region, session_id
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "server_region": server_region,
+                "session_id": session_id,
+            }))
+            .send()
+            .await
+            .map_err(|e| SdkError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            error!("Relay ticket fetch failed: {} - {}", status, body);
+            return Err(SdkError::Auth(format!(
+                "Relay ticket fetch failed: {} - {}",
+                status, body
+            )));
+        }
+
+        let data: RelayTicketResponse = response
+            .json()
+            .await
+            .map_err(|e| SdkError::Auth(format!("Failed to parse relay ticket: {}", e)))?;
+
+        info!(
+            "Received relay ticket (auth_required: {}, key_id: {})",
+            data.auth_required, data.key_id
+        );
         Ok(data)
     }
 

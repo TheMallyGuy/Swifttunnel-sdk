@@ -14,6 +14,8 @@ pub enum AuthState {
     AwaitingOAuthCallback(OAuthPendingState),
     /// Logged in with valid tokens
     LoggedIn(AuthSession),
+    /// Logged in but account is banned; session preserved for display purposes
+    Banned(AuthSession),
     /// Error state
     Error(String),
 }
@@ -59,6 +61,14 @@ impl AuthSession {
 pub struct UserInfo {
     pub id: String,
     pub email: String,
+    #[serde(default)]
+    pub is_tester: bool,
+    #[serde(default)]
+    pub is_banned: bool,
+    #[serde(default)]
+    pub banned_reason: Option<String>,
+    #[serde(default)]
+    pub banned_at: Option<String>,
 }
 
 /// Supabase auth response
@@ -110,6 +120,23 @@ pub struct VpnConfig {
     /// Phantun port (typically 443)
     #[serde(default)]
     pub phantun_port: Option<u16>,
+}
+
+/// Response from the V3 relay ticket bootstrap endpoint (`/api/vpn/relay-ticket`).
+///
+/// The relay server requires an authenticated handshake before it will forward
+/// any packets. The `token` is presented to the relay via an auth-hello frame.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayTicketResponse {
+    /// Opaque auth token to present to the relay in the auth-hello frame.
+    pub token: String,
+    /// Whether the relay enforces authentication. If false, legacy unauthenticated
+    /// forwarding is still accepted by the relay.
+    #[serde(default)]
+    pub auth_required: bool,
+    /// Signing key id used by the relay (informational).
+    #[serde(default)]
+    pub key_id: String,
 }
 
 /// Response from the desktop OAuth exchange API

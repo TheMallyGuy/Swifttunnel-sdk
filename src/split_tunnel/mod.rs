@@ -107,6 +107,11 @@ impl SplitTunnelDriver {
         self.interceptor.set_auto_router(router);
     }
 
+    /// Enable/disable Route Assist (tunnel Roblox TCP API/bootstrap traffic).
+    pub fn set_api_tunneling_enabled(&self, enabled: bool) {
+        self.interceptor.set_api_tunneling_enabled(enabled);
+    }
+
     /// Switch relay destination without restarting split tunnel.
     pub fn switch_relay_addr(&self, new_addr: std::net::SocketAddr) -> bool {
         self.interceptor.switch_relay_addr(new_addr)

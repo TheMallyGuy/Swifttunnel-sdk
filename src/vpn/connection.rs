@@ -18,11 +18,39 @@ use crate::auth::types::VpnConfig;
 use crate::callbacks::{fire_auto_routing_event, fire_error, fire_state_change};
 
 use super::auto_routing::{AutoRouter, AutoRoutingEvent};
-use super::config::fetch_vpn_config;
 use super::geolocation::lookup_game_server_region;
 use super::relay::UdpRelay;
 
 const REFRESH_INTERVAL_MS: u64 = 50;
+
+/// Resolve a relay SocketAddr for `region` from the pre-loaded server list.
+/// Picks the candidate with the lowest known latency, falling back to the first match.
+fn resolve_relay_for_region(
+    region: &str,
+    available_servers: &[(String, SocketAddr, Option<u32>)],
+) -> Result<SocketAddr, crate::error::SdkError> {
+    if available_servers.is_empty() {
+        return Err(crate::error::SdkError::Vpn(
+            "No servers available — call swifttunnel_servers_fetch first".to_string(),
+        ));
+    }
+
+    // Exact match first, then prefix (e.g. "us-east" matches "us-east-nj")
+    let candidates: Vec<_> = available_servers
+        .iter()
+        .filter(|(r, _, _)| r == region || r.starts_with(region) || region.starts_with(r.as_str()))
+        .collect();
+
+    let chosen = candidates
+        .iter()
+        .min_by_key(|(_, _, lat)| lat.unwrap_or(u32::MAX))
+        .or_else(|| candidates.first())
+        .map(|(_, addr, _)| *addr);
+
+    chosen.ok_or_else(|| {
+        crate::error::SdkError::Vpn(format!("No server found for region '{}'", region))
+    })
+}
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -67,8 +95,14 @@ pub enum ConnectionState {
         since: Instant,
         server_region: String,
         server_endpoint: String,
+        /// Client's assigned IP address from the VPN config
+        assigned_ip: String,
+        /// Authentication mode used by the relay (e.g. "authenticated")
+        relay_auth_mode: String,
         split_tunnel_active: bool,
         tunneled_processes: Vec<String>,
+        /// Relay health: None = healthy, "stale" = no traffic 30s+, "dead" = no response 60s+
+        relay_status: Option<String>,
     },
     Disconnecting,
     Error(String),
@@ -133,6 +167,9 @@ pub struct VpnConnection {
     config: Option<VpnConfig>,
     process_monitor_stop: Arc<AtomicBool>,
     auto_router: Option<Arc<AutoRouter>>,
+    /// Whether Route Assist wrote bootstrap DNS overrides to the hosts file
+    /// (so cleanup knows to remove them).
+    bootstrap_dns_applied: bool,
 }
 
 impl VpnConnection {
@@ -144,6 +181,7 @@ impl VpnConnection {
             config: None,
             process_monitor_stop: Arc::new(AtomicBool::new(false)),
             auto_router: None,
+            bootstrap_dns_applied: false,
         }
     }
 
@@ -215,10 +253,12 @@ impl VpnConnection {
             false,
             Vec::new(),
             Vec::new(),
+            false,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_ex(
         &mut self,
         access_token: &str,
@@ -227,6 +267,7 @@ impl VpnConnection {
         auto_routing_enabled: bool,
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
         whitelisted_regions: Vec<String>,
+        enable_api_tunneling: bool,
     ) -> Result<(), crate::error::SdkError> {
         {
             let state = self.state.lock().await;
@@ -240,29 +281,58 @@ impl VpnConnection {
             }
         }
 
+        log::info!(
+            "connect_ex: region={} apps={:?} auto_routing={} whitelisted={:?} servers={} route_assist={}",
+            region,
+            tunnel_apps,
+            auto_routing_enabled,
+            whitelisted_regions,
+            available_servers.len(),
+            enable_api_tunneling
+        );
+
         self.set_state(ConnectionState::FetchingConfig).await;
-        let config = match fetch_vpn_config(access_token, region).await {
-            Ok(c) => c,
-            Err(e) => {
-                self.set_state(ConnectionState::Error(e.to_string())).await;
-                return Err(e);
+
+        // Route Assist: repair Roblox bootstrap DNS via the hosts file so the
+        // banned/blocked client can reach Roblox's launch/API endpoints, and so
+        // those IPs become eligible for TCP tunneling. Best-effort; a failure
+        // here must not block the game-traffic tunnel.
+        if enable_api_tunneling && !tunnel_apps.is_empty() {
+            match crate::roblox_proxy::hosts::apply_bootstrap_overrides().await {
+                Ok(()) => {
+                    self.bootstrap_dns_applied = true;
+                    log::info!("Route Assist: applied Roblox bootstrap DNS repair");
+                }
+                Err(e) => {
+                    log::warn!("Route Assist: bootstrap DNS repair skipped: {}", e);
+                }
             }
+        }
+
+        // V3: resolve the relay address directly from the server list — no API call needed.
+        let relay_addr = resolve_relay_for_region(region, &available_servers)?;
+        log::info!("connect_ex: resolved relay {} for region {}", relay_addr, region);
+
+        let config = crate::auth::types::VpnConfig {
+            region: region.to_string(),
+            endpoint: relay_addr.to_string(),
+            ..Default::default()
         };
 
         self.config = Some(config.clone());
-
         self.set_state(ConnectionState::Connecting).await;
-        let vpn_ip = config
-            .endpoint
-            .split(':')
-            .next()
-            .unwrap_or(&config.endpoint);
-        let relay_addr: SocketAddr = format!("{}:51821", vpn_ip)
-            .parse()
-            .map_err(|e| crate::error::SdkError::Vpn(format!("Invalid relay address: {}", e)))?;
 
         let relay = Arc::new(UdpRelay::new(relay_addr)?);
         self.relay = Some(Arc::clone(&relay));
+
+        // V3: authenticate the relay session. The relay server requires an
+        // auth-hello handshake before it will forward any packets. Without this
+        // the tunnel "connects" but no traffic is relayed (the symptom we saw:
+        // Roblox detected + split tunnel up, but nothing tunneled).
+        let relay_auth_mode = self
+            .authenticate_relay(access_token, &config.region, &relay)
+            .await;
+        log::info!("connect_ex: relay auth mode = {}", relay_auth_mode);
 
         self.set_state(ConnectionState::ConfiguringSplitTunnel)
             .await;
@@ -276,6 +346,7 @@ impl VpnConnection {
                     auto_routing_enabled,
                     available_servers,
                     whitelisted_regions,
+                    enable_api_tunneling,
                 )
                 .await
             {
@@ -298,14 +369,89 @@ impl VpnConnection {
             since: Instant::now(),
             server_region: config.region.clone(),
             server_endpoint: config.endpoint.clone(),
+            assigned_ip: config.assigned_ip.clone(),
+            relay_auth_mode,
             split_tunnel_active,
             tunneled_processes,
+            relay_status: None,
         })
         .await;
 
         Ok(())
     }
 
+    /// Perform the V3 relay auth handshake. Returns the resulting auth mode
+    /// string for the connected state. Best-effort: on ticket/handshake failure
+    /// we fall back to legacy (unauthenticated) mode and continue, matching the
+    /// desktop app — the relay itself rejects traffic if auth is mandatory.
+    async fn authenticate_relay(
+        &self,
+        access_token: &str,
+        region: &str,
+        relay: &Arc<UdpRelay>,
+    ) -> String {
+        let auth_client = crate::auth::client::AuthClient::new();
+        let session_id_hex = relay.session_id_hex();
+
+        let ticket = match auth_client
+            .get_relay_ticket(access_token, region, &session_id_hex)
+            .await
+        {
+            Ok(ticket) => ticket,
+            Err(e) => {
+                log::warn!(
+                    "Relay ticket unavailable for '{}' ({}); falling back to legacy relay mode",
+                    region,
+                    e
+                );
+                return "legacy_fallback".to_string();
+            }
+        };
+
+        // Run the blocking UDP handshake off the async runtime.
+        let relay_for_auth = Arc::clone(relay);
+        let token = ticket.token.clone();
+        let handshake = tokio::task::spawn_blocking(move || {
+            relay_for_auth.authenticate_with_ticket(&token)
+        })
+        .await;
+
+        match handshake {
+            Ok(Ok(Some(super::relay::RelayAuthAckStatus::Ok))) => {
+                log::info!("Relay authenticated (session {}, region {})", session_id_hex, region);
+                "authenticated".to_string()
+            }
+            Ok(Ok(Some(super::relay::RelayAuthAckStatus::AuthDisabled))) => {
+                log::info!("Relay reports auth disabled; using legacy relay mode");
+                "legacy_fallback".to_string()
+            }
+            Ok(Ok(Some(status))) => {
+                log::warn!(
+                    "Relay auth rejected ({}) for session {}; falling back to legacy relay mode",
+                    status.as_str(),
+                    session_id_hex
+                );
+                "legacy_fallback".to_string()
+            }
+            Ok(Ok(None)) => {
+                log::warn!(
+                    "Relay auth timed out for session {}; falling back to legacy relay mode",
+                    session_id_hex
+                );
+                "legacy_fallback".to_string()
+            }
+            Ok(Err(e)) => {
+                log::warn!("Relay auth handshake error: {}; falling back to legacy relay mode", e);
+                "legacy_fallback".to_string()
+            }
+            Err(e) => {
+                log::warn!("Relay auth task join error: {}; falling back to legacy relay mode", e);
+                "legacy_fallback".to_string()
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn setup_split_tunnel(
         &mut self,
         config: &VpnConfig,
@@ -314,20 +460,32 @@ impl VpnConnection {
         auto_routing_enabled: bool,
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
         whitelisted_regions: Vec<String>,
+        enable_api_tunneling: bool,
     ) -> Result<Vec<String>, crate::error::SdkError> {
+        log::info!("setup_split_tunnel: apps={:?} relay={} auto_routing={} whitelisted={:?} route_assist={}",
+            tunnel_apps, config.endpoint, auto_routing_enabled, whitelisted_regions, enable_api_tunneling);
+
         if !crate::split_tunnel::SplitTunnelDriver::check_driver_available() {
+            log::error!("setup_split_tunnel: WPF driver not available");
             return Err(crate::error::SdkError::SplitTunnel(
                 "Windows Packet Filter driver not available".to_string(),
             ));
         }
+        log::info!("setup_split_tunnel: WPF driver available");
 
         let mut driver = crate::split_tunnel::SplitTunnelDriver::new(tunnel_apps.clone());
         driver.initialize().map_err(|e| {
             crate::error::SdkError::SplitTunnel(format!("Failed to initialize driver: {}", e))
         })?;
+        log::info!("setup_split_tunnel: driver initialized");
         driver.configure(tunnel_apps.clone()).map_err(|e| {
             crate::error::SdkError::SplitTunnel(format!("Failed to configure split tunnel: {}", e))
         })?;
+        log::info!("setup_split_tunnel: driver configured");
+
+        // Route Assist: tell the interceptor to tunnel Roblox TCP API/bootstrap
+        // traffic in addition to UDP game traffic.
+        driver.set_api_tunneling_enabled(enable_api_tunneling);
 
         let relay_ctx =
             crate::split_tunnel::SplitTunnelDriver::relay_context_from_udp_relay(relay)?;
@@ -499,6 +657,14 @@ impl VpnConnection {
         }
         self.split_tunnel = None;
 
+        // Route Assist: remove any hosts-file DNS overrides we applied.
+        if self.bootstrap_dns_applied {
+            if let Err(e) = crate::roblox_proxy::hosts::remove_overrides_async().await {
+                log::warn!("Route Assist: failed to remove bootstrap DNS overrides: {}", e);
+            }
+            self.bootstrap_dns_applied = false;
+        }
+
         self.config = None;
     }
 
@@ -542,6 +708,12 @@ impl Drop for VpnConnection {
             if let Ok(mut guard) = driver.try_lock() {
                 guard.close();
             }
+        }
+        // Route Assist: best-effort synchronous hosts cleanup so we never leave
+        // stale DNS overrides behind if the process is torn down.
+        if self.bootstrap_dns_applied {
+            let _ = crate::roblox_proxy::hosts::remove_overrides();
+            self.bootstrap_dns_applied = false;
         }
     }
 }

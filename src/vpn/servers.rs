@@ -68,6 +68,24 @@ pub struct DynamicServerInfo {
     pub port: u16,
     pub phantun_available: bool,
     pub phantun_port: Option<u16>,
+    /// Whether the V3 UDP relay is available on this server
+    #[serde(default = "default_relay_available")]
+    pub relay_available: bool,
+    /// Relay UDP port; falls back to `port` when absent
+    #[serde(default)]
+    pub relay_port: Option<u16>,
+}
+
+fn default_relay_available() -> bool {
+    true
+}
+
+impl DynamicServerInfo {
+    /// The port to use for relay connectivity.
+    /// Prefers the explicit `relay_port` field; falls back to the primary `port`.
+    pub fn effective_relay_port(&self) -> u16 {
+        self.relay_port.unwrap_or(self.port)
+    }
 }
 
 /// Dynamic gaming region (from API)

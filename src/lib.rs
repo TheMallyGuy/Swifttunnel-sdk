@@ -7,6 +7,7 @@
 mod auth;
 mod callbacks;
 mod error;
+mod roblox_proxy;
 mod runtime;
 mod split_tunnel;
 mod vpn;
@@ -50,6 +51,16 @@ struct ConnectExOptions {
     apps: Vec<String>,
     #[serde(default)]
     auto_routing: AutoRoutingOptions,
+    /// Override the relay server endpoint (disables auto-routing when set)
+    #[serde(default)]
+    custom_relay_server: Option<String>,
+    /// Per-region forced server overrides: region_id → server_id
+    #[serde(default)]
+    forced_servers: std::collections::HashMap<String, String>,
+    /// Route Assist: tunnel Roblox TCP API/bootstrap traffic and repair its
+    /// bootstrap DNS (helps bypass network/country bans).
+    #[serde(default)]
+    enable_api_tunneling: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -109,8 +120,9 @@ fn load_available_servers_for_auto_routing(
         .servers
         .servers()
         .iter()
+        .filter(|s| s.relay_available)
         .filter_map(|s| {
-            let addr: SocketAddr = format!("{}:51821", s.ip).parse().ok()?;
+            let addr: SocketAddr = format!("{}:{}", s.ip, s.effective_relay_port()).parse().ok()?;
             let latency = state.servers.get_latency(&s.region);
             Some((s.region.clone(), addr, latency))
         })
@@ -126,11 +138,7 @@ fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 
         }
     };
 
-    let available_servers = if options.auto_routing.enabled {
-        load_available_servers_for_auto_routing(state)
-    } else {
-        Vec::new()
-    };
+    let available_servers = load_available_servers_for_auto_routing(state);
 
     match runtime().block_on(state.vpn.connect_ex(
         &token,
@@ -139,6 +147,7 @@ fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 
         options.auto_routing.enabled,
         available_servers,
         options.auto_routing.whitelisted_regions,
+        options.enable_api_tunneling,
     )) {
         Ok(()) => SUCCESS,
         Err(e) => {
@@ -182,8 +191,22 @@ pub extern "C" fn swifttunnel_init() -> i32 {
         return SUCCESS; // already initialised
     }
 
-    // Initialise logger (ignore errors if already set)
-    let _ = env_logger::try_init();
+    // Initialise logger — write to a file so logs are visible even without a console.
+    let log_path = std::env::temp_dir().join("swifttunnel_sdk.log");
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Info)
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .try_init();
+    } else {
+        let _ = env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Info)
+            .try_init();
+    }
 
     log::info!(
         "SwiftTunnel SDK v{} initialising",
@@ -405,7 +428,7 @@ pub extern "C" fn swifttunnel_auth_is_logged_in() -> i32 {
 /// Get user info as JSON.  Returns null if not logged in.
 /// Caller must free the returned string.
 ///
-/// JSON shape: `{"id":"...","email":"..."}`
+/// JSON shape: `{"id":"...","email":"...","is_tester":false,"is_banned":false,"banned_reason":null,"banned_at":null}`
 #[no_mangle]
 pub extern "C" fn swifttunnel_auth_get_user_json() -> *mut c_char {
     clear_error();
@@ -567,6 +590,9 @@ pub unsafe extern "C" fn swifttunnel_connect(
         region,
         apps,
         auto_routing: AutoRoutingOptions::default(),
+        custom_relay_server: None,
+        forced_servers: std::collections::HashMap::new(),
+        enable_api_tunneling: false,
     };
 
     let mut guard = SDK.lock();
@@ -705,16 +731,22 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
         ConnectionState::Connected {
             server_region,
             server_endpoint,
+            assigned_ip,
+            relay_auth_mode,
             split_tunnel_active,
             tunneled_processes,
+            relay_status,
             ..
         } => serde_json::json!({
             "state": "Connected",
             "code": conn_state.as_code(),
             "region": server_region,
             "endpoint": server_endpoint,
+            "assigned_ip": assigned_ip,
+            "relay_auth_mode": relay_auth_mode,
             "split_tunnel_active": split_tunnel_active,
             "tunneled_processes": tunneled_processes,
+            "relay_status": relay_status,
             "auto_routing": state
                 .vpn
                 .auto_routing_snapshot()

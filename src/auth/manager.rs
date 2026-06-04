@@ -86,6 +86,7 @@ impl AuthManager {
                 AuthState::LoggingIn => "LoggingIn",
                 AuthState::AwaitingOAuthCallback(_) => "AwaitingOAuthCallback",
                 AuthState::Error(_) => "Error",
+                AuthState::Banned(_) => "Banned",
             }
         );
 
@@ -135,6 +136,10 @@ impl AuthManager {
                     user: UserInfo {
                         id: response.user.id,
                         email: response.user.email.unwrap_or_else(|| email.to_string()),
+                        is_tester: false,
+                        is_banned: false,
+                        banned_reason: None,
+                        banned_at: None,
                     },
                 };
 
@@ -256,6 +261,10 @@ impl AuthManager {
                     .user
                     .email
                     .unwrap_or_else(|| session.user.email.clone()),
+                is_tester: session.user.is_tester,
+                is_banned: session.user.is_banned,
+                banned_reason: session.user.banned_reason.clone(),
+                banned_at: session.user.banned_at.clone(),
             },
         })
     }
@@ -519,6 +528,10 @@ impl AuthManager {
                     .user
                     .email
                     .unwrap_or(exchange_response.email),
+                is_tester: false,
+                is_banned: false,
+                banned_reason: None,
+                banned_at: None,
             },
         };
 
