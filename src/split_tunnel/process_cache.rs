@@ -338,6 +338,15 @@ impl ProcessSnapshot {
         self.is_tunnel_pid(pid)
     }
 
+    /// Whether an outbound flow's source `(ip, port, proto)` belongs to a tunnel
+    /// app — by connection ownership or the UDP port fallback. Used by the URL
+    /// logger to record only tunnel-app destinations.
+    #[inline]
+    pub fn is_tunnel_source(&self, local_ip: Ipv4Addr, local_port: u16, protocol: Protocol) -> bool {
+        self.is_tunnel_connection(local_ip, local_port, protocol)
+            || self.should_tunnel_by_port_fallback(local_port, protocol)
+    }
+
     /// Get PID for connection (for debugging)
     #[inline]
     pub fn get_pid(&self, local_ip: Ipv4Addr, local_port: u16, protocol: Protocol) -> Option<u32> {

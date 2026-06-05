@@ -99,7 +99,19 @@ impl SplitTunnelDriver {
     ) -> Result<Arc<RelayForwardContext>, SdkError> {
         Ok(Arc::new(RelayForwardContext {
             relay: Arc::clone(relay),
+            asset_relays: Vec::new(),
         }))
+    }
+
+    /// Build a relay context with a pool of asset relays for asset-host traffic.
+    pub fn relay_context_with_asset_relays(
+        relay: &Arc<crate::vpn::UdpRelay>,
+        asset_relays: Vec<Arc<crate::vpn::UdpRelay>>,
+    ) -> Arc<RelayForwardContext> {
+        Arc::new(RelayForwardContext {
+            relay: Arc::clone(relay),
+            asset_relays,
+        })
     }
 
     /// Set auto-router used for runtime relay switching + whitelist bypass.

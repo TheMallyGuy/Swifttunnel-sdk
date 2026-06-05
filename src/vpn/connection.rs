@@ -52,6 +52,134 @@ fn resolve_relay_for_region(
     })
 }
 
+fn region_matches(server_region: &str, region: &str) -> bool {
+    server_region == region
+        || server_region.starts_with(region)
+        || region.starts_with(server_region)
+}
+
+/// Pick up to `count` SwiftTunnel servers for the asset-relay pool.
+///
+/// Prefers servers in *different* regions from gameplay (e.g. US, Mumbai) so
+/// asset load lands far away and doesn't consume the gameplay region's (SG)
+/// capacity. Only distinct IPs (and never the gameplay relay's IP). Shuffled so
+/// load spreads across the fleet. Falls back to any different-IP server if every
+/// server is in the gameplay region. Returns `(region, addr)` pairs.
+fn pick_asset_relays(
+    available: &[(String, SocketAddr, Option<u32>)],
+    primary: SocketAddr,
+    region: &str,
+    count: usize,
+) -> Vec<(String, SocketAddr)> {
+    use rand::seq::SliceRandom;
+    use std::collections::HashSet;
+
+    let mut rng = rand::thread_rng();
+
+    let dedup = |servers: Vec<&(String, SocketAddr, Option<u32>)>| -> Vec<(String, SocketAddr)> {
+        let mut seen: HashSet<std::net::IpAddr> = HashSet::new();
+        let mut out = Vec::new();
+        for (r, a, _) in servers {
+            if a.ip() != primary.ip() && seen.insert(a.ip()) {
+                out.push((r.clone(), *a));
+            }
+        }
+        out
+    };
+
+    // Prefer far regions (different from gameplay) so SG stays free for gameplay.
+    let mut far: Vec<&(String, SocketAddr, Option<u32>)> = available
+        .iter()
+        .filter(|(r, _, _)| !region_matches(r, region))
+        .collect();
+    far.shuffle(&mut rng);
+    let mut pool = dedup(far);
+
+    // Fall back to any different-IP server (incl. same region) if needed.
+    if pool.len() < count {
+        let mut rest: Vec<&(String, SocketAddr, Option<u32>)> = available.iter().collect();
+        rest.shuffle(&mut rng);
+        for (r, a) in dedup(rest) {
+            if pool.len() >= count {
+                break;
+            }
+            if !pool.iter().any(|(_, pa)| pa.ip() == a.ip()) {
+                pool.push((r, a));
+            }
+        }
+    }
+
+    pool.truncate(count);
+    pool
+}
+
+/// V3 relay auth handshake (free fn so the asset-relay pool can authenticate
+/// members concurrently). Best-effort: on ticket/handshake failure we fall back
+/// to legacy mode and continue — the relay itself rejects traffic if auth is
+/// mandatory.
+async fn authenticate_relay_handshake(
+    access_token: &str,
+    region: &str,
+    relay: &Arc<UdpRelay>,
+) -> String {
+    let auth_client = crate::auth::client::AuthClient::new();
+    let session_id_hex = relay.session_id_hex();
+
+    let ticket = match auth_client
+        .get_relay_ticket(access_token, region, &session_id_hex)
+        .await
+    {
+        Ok(ticket) => ticket,
+        Err(e) => {
+            log::warn!(
+                "Relay ticket unavailable for '{}' ({}); falling back to legacy relay mode",
+                region,
+                e
+            );
+            return "legacy_fallback".to_string();
+        }
+    };
+
+    let relay_for_auth = Arc::clone(relay);
+    let token = ticket.token.clone();
+    let handshake =
+        tokio::task::spawn_blocking(move || relay_for_auth.authenticate_with_ticket(&token)).await;
+
+    match handshake {
+        Ok(Ok(Some(super::relay::RelayAuthAckStatus::Ok))) => {
+            log::info!("Relay authenticated (session {}, region {})", session_id_hex, region);
+            "authenticated".to_string()
+        }
+        Ok(Ok(Some(super::relay::RelayAuthAckStatus::AuthDisabled))) => {
+            log::info!("Relay reports auth disabled; using legacy relay mode");
+            "legacy_fallback".to_string()
+        }
+        Ok(Ok(Some(status))) => {
+            log::warn!(
+                "Relay auth rejected ({}) for session {}; falling back to legacy relay mode",
+                status.as_str(),
+                session_id_hex
+            );
+            "legacy_fallback".to_string()
+        }
+        Ok(Ok(None)) => {
+            log::warn!(
+                "Relay auth timed out for session {}; falling back to legacy relay mode",
+                session_id_hex
+            );
+            "legacy_fallback".to_string()
+        }
+        Ok(Err(e)) => {
+            log::warn!("Relay auth handshake error: {}; falling back to legacy relay mode", e);
+            "legacy_fallback".to_string()
+        }
+        Err(e) => {
+            log::warn!("Relay auth task join error: {}; falling back to legacy relay mode", e);
+            "legacy_fallback".to_string()
+        }
+    }
+}
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -163,6 +291,8 @@ impl Default for ConnectionState {
 pub struct VpnConnection {
     state: Arc<Mutex<ConnectionState>>,
     relay: Option<Arc<UdpRelay>>,
+    /// Pool of relays for asset traffic (separate exit IPs in far regions).
+    asset_relays: Vec<Arc<UdpRelay>>,
     split_tunnel: Option<Arc<Mutex<crate::split_tunnel::SplitTunnelDriver>>>,
     config: Option<VpnConfig>,
     process_monitor_stop: Arc<AtomicBool>,
@@ -177,6 +307,7 @@ impl VpnConnection {
         Self {
             state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
             relay: None,
+            asset_relays: Vec::new(),
             split_tunnel: None,
             config: None,
             process_monitor_stop: Arc::new(AtomicBool::new(false)),
@@ -254,6 +385,10 @@ impl VpnConnection {
             Vec::new(),
             Vec::new(),
             false,
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
         )
         .await
     }
@@ -268,6 +403,10 @@ impl VpnConnection {
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
         whitelisted_regions: Vec<String>,
         enable_api_tunneling: bool,
+        excluded_urls: Vec<String>,
+        asset_relay_server: Option<String>,
+        asset_urls: Vec<String>,
+        asset_relay_count: usize,
     ) -> Result<(), crate::error::SdkError> {
         {
             let state = self.state.lock().await;
@@ -282,14 +421,22 @@ impl VpnConnection {
         }
 
         log::info!(
-            "connect_ex: region={} apps={:?} auto_routing={} whitelisted={:?} servers={} route_assist={}",
+            "connect_ex: region={} apps={:?} auto_routing={} whitelisted={:?} servers={} route_assist={} excluded_urls={:?}",
             region,
             tunnel_apps,
             auto_routing_enabled,
             whitelisted_regions,
             available_servers.len(),
-            enable_api_tunneling
+            enable_api_tunneling,
+            excluded_urls
         );
+
+        // Resolve user URL exclusions to IPs up-front so the classifier can
+        // bypass them. Best-effort; failures just mean fewer exclusions.
+        crate::exclusions::resolve_and_set(&excluded_urls).await;
+
+        // Start a fresh destination ("URL") log session for this connect.
+        crate::url_log::begin_session(region, enable_api_tunneling);
 
         self.set_state(ConnectionState::FetchingConfig).await;
 
@@ -334,6 +481,22 @@ impl VpnConnection {
             .await;
         log::info!("connect_ex: relay auth mode = {}", relay_auth_mode);
 
+        // Optional asset-relay pool (separate exit IPs in far regions) to dodge
+        // Roblox's per-IP 429 on assetdelivery. Resolve the asset host set + bring
+        // up N authenticated relays. Best-effort: if empty, assets fall back to
+        // the primary relay.
+        let asset_relays = self
+            .setup_asset_relays(
+                access_token,
+                region,
+                asset_relay_server,
+                asset_urls,
+                &available_servers,
+                relay_addr,
+                asset_relay_count,
+            )
+            .await;
+
         self.set_state(ConnectionState::ConfiguringSplitTunnel)
             .await;
 
@@ -342,6 +505,7 @@ impl VpnConnection {
                 .setup_split_tunnel(
                     &config,
                     &relay,
+                    asset_relays.clone(),
                     tunnel_apps.clone(),
                     auto_routing_enabled,
                     available_servers,
@@ -380,75 +544,114 @@ impl VpnConnection {
         Ok(())
     }
 
-    /// Perform the V3 relay auth handshake. Returns the resulting auth mode
-    /// string for the connected state. Best-effort: on ticket/handshake failure
-    /// we fall back to legacy (unauthenticated) mode and continue, matching the
-    /// desktop app — the relay itself rejects traffic if auth is mandatory.
+    /// Bring up the asset-relay pool: resolve the asset host set, pick up to
+    /// `count` far-region SwiftTunnel servers (or an explicit override), connect
+    /// + authenticate them concurrently. Returns the relay handles (also stored
+    /// on `self`). Best-effort — asset traffic falls back to the primary relay
+    /// when the pool is empty.
+    #[allow(clippy::too_many_arguments)]
+    async fn setup_asset_relays(
+        &mut self,
+        access_token: &str,
+        region: &str,
+        asset_relay_server: Option<String>,
+        asset_urls: Vec<String>,
+        available_servers: &[(String, SocketAddr, Option<u32>)],
+        primary_addr: SocketAddr,
+        count: usize,
+    ) -> Vec<Arc<UdpRelay>> {
+        // Asset routing is requested by providing asset_urls.
+        if asset_urls.is_empty() {
+            return Vec::new();
+        }
+
+        // Resolve which destination IPs should ride the asset relays.
+        let n = crate::asset_route::resolve_and_set(&asset_urls).await;
+        if n == 0 {
+            log::warn!("asset relay: no asset IPs resolved; skipping asset relays");
+            return Vec::new();
+        }
+
+        // Default pool size of 3 when unspecified.
+        let count = if count == 0 { 3 } else { count };
+
+        // Determine target endpoints: explicit override (single), or a pool of
+        // far-region SwiftTunnel servers with distinct IPs.
+        let targets: Vec<(String, SocketAddr)> = if let Some(server) = asset_relay_server {
+            let a = match server.parse::<SocketAddr>() {
+                Ok(a) => a,
+                Err(_) => match tokio::net::lookup_host(&server).await {
+                    Ok(mut it) => it.next(),
+                    Err(e) => {
+                        log::warn!("asset relay: failed to resolve '{}': {}", server, e);
+                        None
+                    }
+                }
+                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+            };
+            if a.ip().is_unspecified() {
+                Vec::new()
+            } else {
+                vec![(region.to_string(), a)]
+            }
+        } else {
+            pick_asset_relays(available_servers, primary_addr, region, count)
+        };
+
+        if targets.is_empty() {
+            log::warn!(
+                "asset relay: no alternate SwiftTunnel servers available; assets use primary relay"
+            );
+            return Vec::new();
+        }
+
+        // Create all relays, then authenticate them concurrently so connect time
+        // doesn't grow linearly with the pool size.
+        let mut created: Vec<(String, SocketAddr, Arc<UdpRelay>)> = Vec::new();
+        for (r, addr) in targets {
+            match UdpRelay::new(addr) {
+                Ok(relay) => created.push((r, addr, Arc::new(relay))),
+                Err(e) => log::warn!("asset relay: failed to create relay to {}: {}", addr, e),
+            }
+        }
+
+        let mut set: tokio::task::JoinSet<(String, SocketAddr, Arc<UdpRelay>, String)> =
+            tokio::task::JoinSet::new();
+        for (r, addr, relay) in created {
+            let token = access_token.to_string();
+            set.spawn(async move {
+                let mode = authenticate_relay_handshake(&token, &r, &relay).await;
+                (r, addr, relay, mode)
+            });
+        }
+
+        let mut relays = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok((r, addr, relay, mode)) = joined {
+                log::info!("asset relay: {} (region={}) auth mode = {}", addr, r, mode);
+                relays.push(relay);
+            }
+        }
+
+        log::info!(
+            "asset relay pool: {} relay(s) up across far regions, routing {} asset IP(s)",
+            relays.len(),
+            n
+        );
+
+        self.asset_relays = relays.clone();
+        relays
+    }
+
+    /// Perform the V3 relay auth handshake. Delegates to the free function so
+    /// the asset-relay pool can authenticate members concurrently.
     async fn authenticate_relay(
         &self,
         access_token: &str,
         region: &str,
         relay: &Arc<UdpRelay>,
     ) -> String {
-        let auth_client = crate::auth::client::AuthClient::new();
-        let session_id_hex = relay.session_id_hex();
-
-        let ticket = match auth_client
-            .get_relay_ticket(access_token, region, &session_id_hex)
-            .await
-        {
-            Ok(ticket) => ticket,
-            Err(e) => {
-                log::warn!(
-                    "Relay ticket unavailable for '{}' ({}); falling back to legacy relay mode",
-                    region,
-                    e
-                );
-                return "legacy_fallback".to_string();
-            }
-        };
-
-        // Run the blocking UDP handshake off the async runtime.
-        let relay_for_auth = Arc::clone(relay);
-        let token = ticket.token.clone();
-        let handshake = tokio::task::spawn_blocking(move || {
-            relay_for_auth.authenticate_with_ticket(&token)
-        })
-        .await;
-
-        match handshake {
-            Ok(Ok(Some(super::relay::RelayAuthAckStatus::Ok))) => {
-                log::info!("Relay authenticated (session {}, region {})", session_id_hex, region);
-                "authenticated".to_string()
-            }
-            Ok(Ok(Some(super::relay::RelayAuthAckStatus::AuthDisabled))) => {
-                log::info!("Relay reports auth disabled; using legacy relay mode");
-                "legacy_fallback".to_string()
-            }
-            Ok(Ok(Some(status))) => {
-                log::warn!(
-                    "Relay auth rejected ({}) for session {}; falling back to legacy relay mode",
-                    status.as_str(),
-                    session_id_hex
-                );
-                "legacy_fallback".to_string()
-            }
-            Ok(Ok(None)) => {
-                log::warn!(
-                    "Relay auth timed out for session {}; falling back to legacy relay mode",
-                    session_id_hex
-                );
-                "legacy_fallback".to_string()
-            }
-            Ok(Err(e)) => {
-                log::warn!("Relay auth handshake error: {}; falling back to legacy relay mode", e);
-                "legacy_fallback".to_string()
-            }
-            Err(e) => {
-                log::warn!("Relay auth task join error: {}; falling back to legacy relay mode", e);
-                "legacy_fallback".to_string()
-            }
-        }
+        authenticate_relay_handshake(access_token, region, relay).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -456,6 +659,7 @@ impl VpnConnection {
         &mut self,
         config: &VpnConfig,
         relay: &Arc<UdpRelay>,
+        asset_relays: Vec<Arc<UdpRelay>>,
         tunnel_apps: Vec<String>,
         auto_routing_enabled: bool,
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
@@ -487,8 +691,10 @@ impl VpnConnection {
         // traffic in addition to UDP game traffic.
         driver.set_api_tunneling_enabled(enable_api_tunneling);
 
-        let relay_ctx =
-            crate::split_tunnel::SplitTunnelDriver::relay_context_from_udp_relay(relay)?;
+        let relay_ctx = crate::split_tunnel::SplitTunnelDriver::relay_context_with_asset_relays(
+            relay,
+            asset_relays,
+        );
         driver.set_relay_context(relay_ctx);
 
         let auto_router = Arc::new(AutoRouter::new(auto_routing_enabled, &config.region));
@@ -646,6 +852,12 @@ impl VpnConnection {
         }
         self.relay = None;
 
+        for asset_relay in &self.asset_relays {
+            asset_relay.stop();
+        }
+        self.asset_relays.clear();
+        crate::asset_route::clear();
+
         if let Some(ref auto_router) = self.auto_router {
             auto_router.reset();
         }
@@ -656,6 +868,9 @@ impl VpnConnection {
             guard.close();
         }
         self.split_tunnel = None;
+
+        // Drop any user URL exclusions.
+        crate::exclusions::clear();
 
         // Route Assist: remove any hosts-file DNS overrides we applied.
         if self.bootstrap_dns_applied {
@@ -703,6 +918,9 @@ impl Drop for VpnConnection {
         self.process_monitor_stop.store(true, Ordering::SeqCst);
         if let Some(ref relay) = self.relay {
             relay.stop();
+        }
+        for asset_relay in &self.asset_relays {
+            asset_relay.stop();
         }
         if let Some(ref driver) = self.split_tunnel {
             if let Ok(mut guard) = driver.try_lock() {

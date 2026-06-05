@@ -8,7 +8,7 @@
 
 use log::{debug, info, warn};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ const DNS_REPAIR_RESOLVERS: &[&str] = &[
     "https://8.8.8.8/resolve",
 ];
 
-static ACTIVE_BOOTSTRAP_IPS: OnceLock<RwLock<HashSet<Ipv4Addr>>> = OnceLock::new();
+static ACTIVE_BOOTSTRAP_IPS: OnceLock<RwLock<HashMap<Ipv4Addr, String>>> = OnceLock::new();
 
 /// Exact Roblox hostnames repaired when Route Assist is enabled.
 ///
@@ -85,7 +85,10 @@ struct DohJsonAnswer {
 /// Existing SwiftTunnel entries are removed first (idempotent).
 pub async fn apply_bootstrap_overrides() -> Result<(), String> {
     let overrides = resolve_bootstrap_overrides().await?;
-    let active_ips: HashSet<Ipv4Addr> = overrides.iter().map(|entry| entry.ip).collect();
+    let active_ips: HashMap<Ipv4Addr, String> = overrides
+        .iter()
+        .map(|entry| (entry.ip, entry.domain.clone()))
+        .collect();
 
     tokio::task::spawn_blocking(move || write_overrides(&overrides))
         .await
@@ -100,8 +103,16 @@ pub async fn apply_bootstrap_overrides() -> Result<(), String> {
 pub fn is_active_bootstrap_ip(ip: Ipv4Addr) -> bool {
     active_bootstrap_ips()
         .read()
-        .map(|ips| ips.contains(&ip))
+        .map(|ips| ips.contains_key(&ip))
         .unwrap_or(false)
+}
+
+/// Resolved bootstrap hostname for an IP, if any (for the URL log).
+pub fn host_for_ip(ip: Ipv4Addr) -> Option<String> {
+    active_bootstrap_ips()
+        .read()
+        .ok()
+        .and_then(|m| m.get(&ip).cloned())
 }
 
 async fn resolve_bootstrap_overrides() -> Result<Vec<HostOverride>, String> {
@@ -290,11 +301,11 @@ pub fn has_overrides() -> bool {
     }
 }
 
-fn active_bootstrap_ips() -> &'static RwLock<HashSet<Ipv4Addr>> {
-    ACTIVE_BOOTSTRAP_IPS.get_or_init(|| RwLock::new(HashSet::new()))
+fn active_bootstrap_ips() -> &'static RwLock<HashMap<Ipv4Addr, String>> {
+    ACTIVE_BOOTSTRAP_IPS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn set_active_bootstrap_ips(ips: HashSet<Ipv4Addr>) {
+fn set_active_bootstrap_ips(ips: HashMap<Ipv4Addr, String>) {
     match active_bootstrap_ips().write() {
         Ok(mut active) => *active = ips,
         Err(e) => warn!("Failed to publish Roblox bootstrap route IPs: {e}"),
@@ -468,8 +479,9 @@ mod tests {
     #[test]
     fn active_bootstrap_ips_roundtrip() {
         let ip = Ipv4Addr::new(65, 9, 168, 80);
-        set_active_bootstrap_ips([ip].into_iter().collect());
+        set_active_bootstrap_ips([(ip, "www.roblox.com".to_string())].into_iter().collect());
         assert!(is_active_bootstrap_ip(ip));
+        assert_eq!(host_for_ip(ip).as_deref(), Some("www.roblox.com"));
         assert!(!is_active_bootstrap_ip(Ipv4Addr::new(65, 9, 168, 81)));
         clear_active_bootstrap_ips();
         assert!(!is_active_bootstrap_ip(ip));

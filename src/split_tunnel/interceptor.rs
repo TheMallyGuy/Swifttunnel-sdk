@@ -161,12 +161,44 @@ fn join_with_timeout(handle: JoinHandle<()>, name: &str) -> bool {
 #[derive(Clone)]
 pub struct RelayForwardContext {
     pub relay: Arc<crate::vpn::UdpRelay>,
+    /// Pool of relays for asset traffic (different exit IPs in far regions), used
+    /// to dodge Roblox's per-IP 429 on `assetdelivery.roblox.com`. Each asset
+    /// connection is hashed to one relay (so a TCP flow stays on one exit IP),
+    /// spreading distinct connections across the pool.
+    pub asset_relays: Vec<Arc<crate::vpn::UdpRelay>>,
 }
 
 impl RelayForwardContext {
-    pub fn forward(&self, ip_packet: &[u8]) -> Result<usize, crate::error::SdkError> {
+    /// Forward an IP packet to the relay. Asset-destined packets go through the
+    /// asset-relay pool (hashed by source port for per-connection stickiness);
+    /// everything else uses the primary gameplay relay.
+    pub fn forward(
+        &self,
+        ip_packet: &[u8],
+        dst_ip: std::net::Ipv4Addr,
+    ) -> Result<usize, crate::error::SdkError> {
+        if !self.asset_relays.is_empty() && crate::asset_route::is_asset_ip(dst_ip) {
+            let idx = asset_relay_index(ip_packet, self.asset_relays.len());
+            return self.asset_relays[idx].forward_outbound(ip_packet);
+        }
         self.relay.forward_outbound(ip_packet)
     }
+}
+
+/// Map an outbound IP packet to an asset-relay pool index by hashing its source
+/// port. Keeps a whole TCP flow on one relay (one exit IP) while spreading
+/// different connections across the pool. `n` must be > 0.
+#[inline]
+fn asset_relay_index(ip_packet: &[u8], n: usize) -> usize {
+    if ip_packet.len() < 20 {
+        return 0;
+    }
+    let ihl = ((ip_packet[0] & 0x0F) as usize) * 4;
+    if ip_packet.len() < ihl + 2 {
+        return 0;
+    }
+    let src_port = u16::from_be_bytes([ip_packet[ihl], ip_packet[ihl + 1]]);
+    (src_port as usize) % n
 }
 
 /// Parallel packet interceptor - V3 only
@@ -208,6 +240,8 @@ pub struct ParallelInterceptor {
     relay_ctx: Option<Arc<RelayForwardContext>>,
     /// Inbound receiver thread handle
     inbound_receiver_handle: Option<JoinHandle<()>>,
+    /// Inbound receiver thread handles for the asset-relay pool
+    asset_inbound_receiver_handles: Vec<JoinHandle<()>>,
     /// Flag to trigger immediate cache refresh (set by ETW)
     refresh_now_flag: Arc<AtomicBool>,
     /// Auto-router for dynamic relay switching and whitelist bypass.
@@ -252,6 +286,7 @@ impl ParallelInterceptor {
             throughput_stats: ThroughputStats::default(),
             relay_ctx: None,
             inbound_receiver_handle: None,
+            asset_inbound_receiver_handles: Vec::new(),
             refresh_now_flag: Arc::new(AtomicBool::new(false)),
             auto_router: None,
             api_tunneling_enabled: Arc::new(AtomicBool::new(false)),
@@ -881,6 +916,28 @@ impl ParallelInterceptor {
                 }));
                 log::info!("V3 inbound receiver thread started");
             }
+
+            // Each asset relay (dedicated exit IP) needs its own inbound receiver
+            // so responses from assetdelivery/CDN are injected back to MSTCP.
+            for asset_relay in &relay_ctx.asset_relays {
+                if let Some(config) = self.create_inbound_config() {
+                    let asset_ctx = Arc::new(RelayForwardContext {
+                        relay: Arc::clone(asset_relay),
+                        asset_relays: Vec::new(),
+                    });
+                    let inbound_stop = Arc::clone(&self.stop_flag);
+                    let throughput = self.throughput_stats.clone();
+                    self.asset_inbound_receiver_handles.push(thread::spawn(move || {
+                        run_v3_inbound_receiver(asset_ctx, config, inbound_stop, throughput);
+                    }));
+                }
+            }
+            if !relay_ctx.asset_relays.is_empty() {
+                log::info!(
+                    "V3 asset-relay inbound receivers started ({})",
+                    relay_ctx.asset_relays.len()
+                );
+            }
         }
 
         log::info!("Parallel interceptor started");
@@ -907,6 +964,9 @@ impl ParallelInterceptor {
         }
         if let Some(handle) = self.inbound_receiver_handle.take() {
             join_with_timeout(handle, "Inbound");
+        }
+        for (i, handle) in self.asset_inbound_receiver_handles.drain(..).enumerate() {
+            join_with_timeout(handle, &format!("AssetInbound-{}", i));
         }
 
         self.active = false;
@@ -1192,8 +1252,14 @@ fn run_packet_worker(
 
         if work.is_outbound {
             let api_tunneling = api_tunneling_enabled.load(Ordering::Relaxed);
-            let should_tunnel =
-                should_route_to_relay(&work.data, &snapshot, &mut inline_cache, api_tunneling);
+            let relay_addr = relay_ctx.as_ref().map(|r| r.relay.relay_addr());
+            let should_tunnel = should_route_to_relay(
+                &work.data,
+                &snapshot,
+                &mut inline_cache,
+                api_tunneling,
+                relay_addr,
+            );
             let auto_routing_bypass =
                 should_tunnel && auto_router.as_ref().map_or(false, |r| r.is_bypassed());
 
@@ -1259,9 +1325,16 @@ fn run_packet_worker(
                 let mut pkt_buf = ip_packet.to_vec();
                 fix_packet_checksums(&mut pkt_buf);
 
-                // V3: Forward via UDP relay
+                // Destination IP selects gameplay vs. asset relay.
+                let fwd_dst_ip = if pkt_buf.len() >= 20 {
+                    Ipv4Addr::new(pkt_buf[16], pkt_buf[17], pkt_buf[18], pkt_buf[19])
+                } else {
+                    Ipv4Addr::UNSPECIFIED
+                };
+
+                // V3: Forward via UDP relay (asset traffic uses the asset relay)
                 if let Some(ref relay) = relay_ctx {
-                    match relay.forward(&pkt_buf) {
+                    match relay.forward(&pkt_buf, fwd_dst_ip) {
                         Ok(_) => {
                             relay_success += 1;
                             if relay_success <= 5 {
@@ -1672,8 +1745,75 @@ fn parse_ports(data: &[u8]) -> Option<(u16, u16)> {
     Some((src_port, dst_port))
 }
 
-/// Determine if packet should be routed to V3 relay
+/// Determine if a packet should be routed to the V3 relay, and record the
+/// destination to the URL log if it belongs to a tunnel app.
 fn should_route_to_relay(
+    data: &[u8],
+    snapshot: &ProcessSnapshot,
+    inline_cache: &mut HashMap<(Ipv4Addr, u16, Protocol), bool>,
+    api_tunneling: bool,
+    relay_addr: Option<std::net::SocketAddr>,
+) -> bool {
+    let decision = classify_packet(data, snapshot, inline_cache, api_tunneling);
+    log_destination(data, snapshot, decision, relay_addr);
+    decision
+}
+
+/// Record a tunnel-app destination to the URL log (deduplicated per session).
+/// Cheap byte parse; only tunnel-app-owned or game-server destinations are logged.
+fn log_destination(
+    data: &[u8],
+    snapshot: &ProcessSnapshot,
+    tunneled: bool,
+    relay_addr: Option<std::net::SocketAddr>,
+) {
+    if data.len() < 14 + 20 + 4 {
+        return;
+    }
+    if u16::from_be_bytes([data[12], data[13]]) != 0x0800 {
+        return;
+    }
+    let ip_start = 14;
+    if (data[ip_start] >> 4) & 0xF != 4 {
+        return;
+    }
+    let ihl = ((data[ip_start] & 0xF) as usize) * 4;
+    let proto = data[ip_start + 9];
+    let protocol = match proto {
+        6 => Protocol::Tcp,
+        17 => Protocol::Udp,
+        _ => return,
+    };
+    let src_ip = Ipv4Addr::new(data[ip_start + 12], data[ip_start + 13], data[ip_start + 14], data[ip_start + 15]);
+    let dst_ip = Ipv4Addr::new(data[ip_start + 16], data[ip_start + 17], data[ip_start + 18], data[ip_start + 19]);
+    let transport_start = ip_start + ihl;
+    if data.len() < transport_start + 4 {
+        return;
+    }
+    let src_port = u16::from_be_bytes([data[transport_start], data[transport_start + 1]]);
+    let dst_port = u16::from_be_bytes([data[transport_start + 2], data[transport_start + 3]]);
+
+    // Only log destinations that are relevant to the tunnel app: owned by it,
+    // or a known Roblox game-server IP. Avoids dumping unrelated machine traffic.
+    let owned = snapshot.is_tunnel_source(src_ip, src_port, protocol)
+        || is_roblox_game_server_ip(dst_ip)
+        || crate::exclusions::is_excluded_ip(dst_ip)
+        || crate::asset_route::is_asset_ip(dst_ip);
+    if !owned {
+        return;
+    }
+
+    // Prefer the user's original exclusion URL (carries the full path), then the
+    // asset host, then the Route Assist bootstrap hostname.
+    let host = crate::exclusions::host_for_ip(dst_ip)
+        .or_else(|| crate::asset_route::host_for_ip(dst_ip))
+        .or_else(|| crate::roblox_proxy::hosts::host_for_ip(dst_ip));
+    crate::url_log::record(dst_ip, dst_port, proto, tunneled, host.as_deref(), relay_addr);
+}
+
+
+/// Pure tunnel/bypass decision for an outbound packet.
+fn classify_packet(
     data: &[u8],
     snapshot: &ProcessSnapshot,
     inline_cache: &mut HashMap<(Ipv4Addr, u16, Protocol), bool>,
@@ -1722,6 +1862,12 @@ fn should_route_to_relay(
 
     let src_port = u16::from_be_bytes([data[transport_start], data[transport_start + 1]]);
     let dst_port = u16::from_be_bytes([data[transport_start + 2], data[transport_start + 3]]);
+
+    // Phase 0: user URL exclusions. Traffic to an excluded host is never
+    // tunneled — bypass it regardless of process/destination rules.
+    if crate::exclusions::is_excluded_ip(dst_ip) {
+        return false;
+    }
 
     // Initial TCP SYN detection (used for Route Assist TCP bootstrap).
     let tcp_flags = if protocol == Protocol::Tcp && data.len() > transport_start + 13 {

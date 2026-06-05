@@ -4,12 +4,15 @@
 //! languages via `cdylib`.  All async work is dispatched through the global
 //! Tokio runtime (`runtime().block_on()`).
 
+mod asset_route;
 mod auth;
 mod callbacks;
 mod error;
+mod exclusions;
 mod roblox_proxy;
 mod runtime;
 mod split_tunnel;
+mod url_log;
 mod vpn;
 
 use std::ffi::{CStr, CString};
@@ -61,6 +64,22 @@ struct ConnectExOptions {
     /// bootstrap DNS (helps bypass network/country bans).
     #[serde(default)]
     enable_api_tunneling: bool,
+    /// URLs/hosts to never tunnel. Each is resolved to IPs at connect time and
+    /// any traffic to those IPs always bypasses the relay.
+    #[serde(default)]
+    excluded_urls: Vec<String>,
+    /// Dedicated relay endpoint (`ip:port` or `host:port`) for asset traffic.
+    /// When set together with `asset_urls`, matching traffic is forwarded
+    /// through this relay (a different exit IP) to dodge Roblox's per-IP 429.
+    #[serde(default)]
+    asset_relay_server: Option<String>,
+    /// URLs/hosts whose traffic should ride the asset relay (e.g.
+    /// `assetdelivery.roblox.com`, `*.rbxcdn.com`).
+    #[serde(default)]
+    asset_urls: Vec<String>,
+    /// Number of far-region relays in the asset pool (0 = default of 3).
+    #[serde(default)]
+    asset_relay_count: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -148,6 +167,10 @@ fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 
         available_servers,
         options.auto_routing.whitelisted_regions,
         options.enable_api_tunneling,
+        options.excluded_urls,
+        options.asset_relay_server,
+        options.asset_urls,
+        options.asset_relay_count,
     )) {
         Ok(()) => SUCCESS,
         Err(e) => {
@@ -593,6 +616,10 @@ pub unsafe extern "C" fn swifttunnel_connect(
         custom_relay_server: None,
         forced_servers: std::collections::HashMap::new(),
         enable_api_tunneling: false,
+        excluded_urls: Vec::new(),
+        asset_relay_server: None,
+        asset_urls: Vec::new(),
+        asset_relay_count: 0,
     };
 
     let mut guard = SDK.lock();
