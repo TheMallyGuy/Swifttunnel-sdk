@@ -54,10 +54,14 @@ ndisapi = "0.6"
 # Secure credential storage (DPAPI on Windows)
 keyring = "3"
 
-# Cryptography for PKCE
+# Cryptography for auth session encryption (AES-256-GCM) and PKCE
+ring = "0.17"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+
+# Windows registry (machine-bound session key derivation)
+winreg = "0.52"
 
 # Date/time handling
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }

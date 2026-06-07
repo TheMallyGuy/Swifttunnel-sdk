@@ -34,8 +34,11 @@ static ACTIVE_BOOTSTRAP_IPS: OnceLock<RwLock<HashMap<Ipv4Addr, String>>> = OnceL
 /// not add bare `roblox.com` or lookalike domains: hosts-file repair is a DNS
 /// bypass for known Roblox bootstrap dependencies, not a wildcard resolver.
 pub const ROBLOX_BOOTSTRAP_DOMAINS: &[&str] = &[
+    "api.roblox.com",
     "clientsettingscdn.roblox.com",
     "clientsettings.roblox.com",
+    "clientsettings.api.roblox.com",
+    "versioncompatibility.api.roblox.com",
     "www.roblox.com",
     "web.roblox.com",
     "apis.roblox.com",
@@ -43,16 +46,28 @@ pub const ROBLOX_BOOTSTRAP_DOMAINS: &[&str] = &[
     "accountsettings.roblox.com",
     "accountinformation.roblox.com",
     "users.roblox.com",
+    "avatar.roblox.com",
+    "catalog.roblox.com",
+    "inventory.roblox.com",
+    "economy.roblox.com",
     "games.roblox.com",
     "gamejoin.roblox.com",
+    "assetgame.roblox.com",
     "assetdelivery.roblox.com",
     "thumbnails.roblox.com",
     "presence.roblox.com",
     "friends.roblox.com",
     "chat.roblox.com",
+    "chatsite.roblox.com",
     "locale.roblox.com",
+    "setup.roblox.com",
+    "captcha.roblox.com",
     "setup.rbxcdn.com",
     "apis.rbxcdn.com",
+    "js.rbxcdn.com",
+    "static.rbxcdn.com",
+    "cdn.arkoselabs.com",
+    "roblox-api.arkoselabs.com",
 ];
 
 fn hosts_path() -> PathBuf {
@@ -455,7 +470,7 @@ mod tests {
 
     #[test]
     fn domain_list_stays_allowlisted_and_exact() {
-        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 19);
+        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 34);
         assert!(!ROBLOX_BOOTSTRAP_DOMAINS.contains(&"roblox.com"));
         assert!(ROBLOX_BOOTSTRAP_DOMAINS.contains(&"gamejoin.roblox.com"));
     }
