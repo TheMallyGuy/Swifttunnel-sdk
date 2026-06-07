@@ -1,5 +1,7 @@
 # SwiftTunnel SDK
 
+**This project is mainatained by claude. I cannot maintain this due to spagetti code**
+
 Native library for integrating SwiftTunnel VPN into third-party applications. Provides a C ABI (`cdylib`) with 31 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
 
 ## Features
