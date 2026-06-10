@@ -300,6 +300,12 @@ pub struct VpnConnection {
     /// Whether Route Assist wrote bootstrap DNS overrides to the hosts file
     /// (so cleanup knows to remove them).
     bootstrap_dns_applied: bool,
+    /// Running GoodbyeDPI helper process (present when `enable_country_ban`
+    /// was requested and the helper was found and started successfully).
+    goodbye_dpi_guard: Option<crate::roblox_proxy::goodbyedpi::GoodbyeDpiGuard>,
+    /// Non-fatal failure message from the GoodbyeDPI startup attempt, surfaced
+    /// to the caller via `take_country_ban_bypass_failure()`.
+    country_ban_bypass_failure: Option<String>,
 }
 
 impl VpnConnection {
@@ -313,6 +319,8 @@ impl VpnConnection {
             process_monitor_stop: Arc::new(AtomicBool::new(false)),
             auto_router: None,
             bootstrap_dns_applied: false,
+            goodbye_dpi_guard: None,
+            country_ban_bypass_failure: None,
         }
     }
 
@@ -389,6 +397,7 @@ impl VpnConnection {
             None,
             Vec::new(),
             0,
+            false,
         )
         .await
     }
@@ -407,6 +416,7 @@ impl VpnConnection {
         asset_relay_server: Option<String>,
         asset_urls: Vec<String>,
         asset_relay_count: usize,
+        enable_country_ban: bool,
     ) -> Result<(), crate::error::SdkError> {
         {
             let state = self.state.lock().await;
@@ -445,13 +455,38 @@ impl VpnConnection {
         // those IPs become eligible for TCP tunneling. Best-effort; a failure
         // here must not block the game-traffic tunnel.
         if enable_api_tunneling && !tunnel_apps.is_empty() {
-            match crate::roblox_proxy::hosts::apply_bootstrap_overrides().await {
+            match crate::roblox_proxy::hosts::apply_bootstrap_overrides(enable_country_ban).await {
                 Ok(()) => {
                     self.bootstrap_dns_applied = true;
-                    log::info!("Route Assist: applied Roblox bootstrap DNS repair");
+                    log::info!(
+                        "Route Assist: applied Roblox bootstrap DNS repair (country_ban_bypass={})",
+                        enable_country_ban
+                    );
                 }
                 Err(e) => {
                     log::warn!("Route Assist: bootstrap DNS repair skipped: {}", e);
+                }
+            }
+        }
+
+        // Bypass Country Bans: launch GoodbyeDPI so DPI/SNI-based blocks on
+        // Roblox traffic are bypassed at the ISP level. Best-effort: a missing
+        // executable is a warning, not an error, so users without GoodbyeDPI
+        // still get the relay bypass.
+        if enable_country_ban {
+            match crate::roblox_proxy::goodbyedpi::start_for_roblox() {
+                Ok(Some(guard)) => {
+                    log::info!("GoodbyeDPI helper started for country ban bypass");
+                    self.goodbye_dpi_guard = Some(guard);
+                }
+                Ok(None) => {
+                    log::warn!(
+                        "GoodbyeDPI helper not available; country ban bypass will rely on relay only"
+                    );
+                }
+                Err(e) => {
+                    log::warn!("GoodbyeDPI helper failed: {}; continuing without DPI bypass", e);
+                    self.country_ban_bypass_failure = Some(e);
                 }
             }
         }
@@ -880,6 +915,13 @@ impl VpnConnection {
             self.bootstrap_dns_applied = false;
         }
 
+        // Stop GoodbyeDPI helper (Drop impl kills the subprocess and removes the
+        // hostlist file).
+        if let Some(mut guard) = self.goodbye_dpi_guard.take() {
+            guard.stop();
+        }
+        self.country_ban_bypass_failure = None;
+
         self.config = None;
     }
 
@@ -889,6 +931,12 @@ impl VpnConnection {
 
     pub fn is_split_tunnel_active(&self) -> bool {
         self.split_tunnel.is_some()
+    }
+
+    /// Take the non-fatal GoodbyeDPI failure message from the last connect, if any.
+    /// Clears the stored message so it is only returned once.
+    pub fn take_country_ban_bypass_failure(&mut self) -> Option<String> {
+        self.country_ban_bypass_failure.take()
     }
 
     pub async fn add_tunnel_app(&mut self, _exe_name: &str) -> Result<(), crate::error::SdkError> {

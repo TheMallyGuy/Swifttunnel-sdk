@@ -6,4 +6,6 @@
 //! network/country ban and improve the odds Roblox places them near the tunneled
 //! region.
 
+pub mod goodbyedpi;
 pub mod hosts;
+pub mod tls_sni;

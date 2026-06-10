@@ -1756,7 +1756,78 @@ fn should_route_to_relay(
 ) -> bool {
     let decision = classify_packet(data, snapshot, inline_cache, api_tunneling);
     log_destination(data, snapshot, decision, relay_addr);
+
+    // SNI learning: if we are relaying a TCP:443 flow and the packet carries a
+    // TLS ClientHello, inspect the SNI to discover whether a launch-critical
+    // Roblox settings host (clientsettings*, versioncompatibility) is being
+    // inadvertently relayed due to a missed pin at connect time. Recording the
+    // IP as direct-only here ensures the bootstrapper's next connection goes
+    // direct — the current flow keeps its relay route.
+    if decision && api_tunneling && data.len() > 14 + 20 + 4 {
+        const IP_START: usize = 14;
+        if data[IP_START + 9] == 6 {
+            let ihl = ((data[IP_START] & 0xF) as usize) * 4;
+            let transport_start = IP_START + ihl;
+            if data.len() > transport_start + 3 {
+                let dst_port =
+                    u16::from_be_bytes([data[transport_start + 2], data[transport_start + 3]]);
+                if dst_port == 443 {
+                    let dst_ip = std::net::Ipv4Addr::new(
+                        data[IP_START + 16],
+                        data[IP_START + 17],
+                        data[IP_START + 18],
+                        data[IP_START + 19],
+                    );
+                    maybe_learn_direct_only_destination(data, IP_START, transport_start, dst_ip);
+                }
+            }
+        }
+    }
+
     decision
+}
+
+/// If `data` carries a TLS ClientHello for a launch-critical direct-only
+/// Roblox settings host, record `dst_ip` so future connections go direct.
+fn maybe_learn_direct_only_destination(
+    data: &[u8],
+    ip_start: usize,
+    transport_start: usize,
+    dst_ip: std::net::Ipv4Addr,
+) {
+    let Some(payload) = tcp_payload(data, ip_start, transport_start) else {
+        return;
+    };
+    if !crate::roblox_proxy::tls_sni::looks_like_client_hello(payload) {
+        return;
+    }
+    let Some(server_name) = crate::roblox_proxy::tls_sni::parse_client_hello_sni(payload) else {
+        return;
+    };
+    if crate::roblox_proxy::hosts::learn_direct_only_bootstrap_ip(server_name, dst_ip) {
+        log::info!(
+            "Route Assist: learned launch-critical settings host {server_name} at {dst_ip} \
+             from a relayed flow's SNI; new connections to it will go direct"
+        );
+    }
+}
+
+/// TCP payload slice of an Ethernet+IPv4+TCP frame, bounded by the IPv4 total
+/// length so Ethernet trailer bytes can never be misread as TLS payload.
+fn tcp_payload(data: &[u8], ip_start: usize, transport_start: usize) -> Option<&[u8]> {
+    let total_len =
+        u16::from_be_bytes([*data.get(ip_start + 2)?, *data.get(ip_start + 3)?]) as usize;
+    let ip_end = ip_start.checked_add(total_len)?.min(data.len());
+
+    let header_len = ((*data.get(transport_start + 12)? >> 4) as usize) * 4;
+    if header_len < 20 {
+        return None;
+    }
+    let payload_start = transport_start.checked_add(header_len)?;
+    if payload_start >= ip_end {
+        return None;
+    }
+    data.get(payload_start..ip_end)
 }
 
 /// Record a tunnel-app destination to the URL log (deduplicated per session).
@@ -1918,12 +1989,18 @@ fn classify_packet(
     // initial SYN of a Roblox HTTPS/API connection (port 80/443) to a repaired
     // bootstrap IP, so account/launch/teleport flows ride the relay even on a
     // banned/blocked network. Only fires when a tunnel app is actually present.
+    //
+    // Exception: launch-critical bootstrap IPs (clientsettings*, etc.) are kept
+    // direct (not relayed) unless "Bypass Country Bans" is enabled — those hosts
+    // must never be relayed unreliably, as a failure produces "Failed to download
+    // or apply critical settings" and Roblox refuses to launch.
     if api_tunneling
         && protocol == Protocol::Tcp
         && is_tcp_initial_syn
         && matches!(dst_port, 80 | 443)
         && !snapshot.tunnel_apps.is_empty()
         && crate::roblox_proxy::hosts::is_active_bootstrap_ip(dst_ip)
+        && !crate::roblox_proxy::hosts::is_direct_only_bootstrap_ip(dst_ip)
     {
         log_speculative_tunnel(src_ip, src_port, dst_ip, dst_port);
         if inline_cache.len() < 10000 {

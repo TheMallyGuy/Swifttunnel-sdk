@@ -8,10 +8,11 @@
 
 use log::{debug, info, warn};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
@@ -19,6 +20,13 @@ const MARKER_START: &str = "# SwiftTunnel Roblox Proxy - START";
 const MARKER_END: &str = "# SwiftTunnel Roblox Proxy - END";
 const DNS_REPAIR_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_REPAIR_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget for the single extra resolution pass that runs when a launch-critical
+/// direct-only host (clientsettings*, versioncompatibility) was not pinned by
+/// the main pass. An unpinned direct-only host loses its "never relay" guard,
+/// so it is worth a few more seconds at connect time — but only one pass, so a
+/// broken resolver can never loop or stall the connect indefinitely.
+const DIRECT_ONLY_RETRY_TOTAL_TIMEOUT: Duration = Duration::from_secs(8);
 const DNS_REPAIR_RESOLVERS: &[&str] = &[
     // IP literals avoid depending on the user's broken local DNS to find
     // the DNS-over-HTTPS resolver itself.
@@ -26,7 +34,42 @@ const DNS_REPAIR_RESOLVERS: &[&str] = &[
     "https://8.8.8.8/resolve",
 ];
 
+/// Maximum IPs pinned per Roblox bootstrap domain.
+///
+/// Roblox serves these hostnames from a CDN/anycast pool, so a single edge IP
+/// resolved from a public DoH resolver may be unreachable from the user's ISP
+/// path. Pinning a few verified IPs gives connection fail-over headroom without
+/// bloating the hosts file.
+const MAX_PINNED_IPS_PER_DOMAIN: usize = 3;
+
+/// Per-IP TCP reachability probe timeout. Short so a dead edge is skipped fast;
+/// the whole repair still runs under `DNS_REPAIR_TOTAL_TIMEOUT`.
+const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// Port used to confirm a resolved Roblox edge actually accepts connections.
+const ROBLOX_HTTPS_PORT: u16 = 443;
+
+/// Active Route Assist IPs → domain name (for URL log).
+/// SDK-specific: the app uses HashSet, but the SDK keeps HashMap for host_for_ip().
 static ACTIVE_BOOTSTRAP_IPS: OnceLock<RwLock<HashMap<Ipv4Addr, String>>> = OnceLock::new();
+/// IPs that have DNS repaired but must NOT be relayed — going direct is safer
+/// for launch-critical bootstrap requests.
+static DIRECT_ONLY_BOOTSTRAP_IPS: OnceLock<RwLock<HashSet<Ipv4Addr>>> = OnceLock::new();
+
+/// True while the current session deliberately relays the launch-critical
+/// settings hosts (country-ban bypass). Runtime SNI learning must not undo
+/// that routing decision.
+static COUNTRY_BAN_BYPASS_ROUTING: AtomicBool = AtomicBool::new(false);
+
+// Keep DNS repair for these launch-critical hosts, but do not publish their IPs
+// to Route Assist. Roblox can fail startup with "Failed to download or apply
+// critical settings" if these bootstrap HTTPS requests are relayed unreliably.
+const DIRECT_ONLY_BOOTSTRAP_DOMAINS: &[&str] = &[
+    "clientsettingscdn.roblox.com",
+    "clientsettings.roblox.com",
+    "clientsettings.api.roblox.com",
+    "versioncompatibility.api.roblox.com",
+];
 
 /// Exact Roblox hostnames repaired when Route Assist is enabled.
 ///
@@ -98,28 +141,106 @@ struct DohJsonAnswer {
 /// Resolve and append Roblox bootstrap overrides to the Windows hosts file.
 ///
 /// Existing SwiftTunnel entries are removed first (idempotent).
-pub async fn apply_bootstrap_overrides() -> Result<(), String> {
+///
+/// `country_ban_bypass`: when the user is bypassing a country ban, the
+/// launch-critical hosts (clientsettings*, versioncompatibility) MUST be routed
+/// through the relay to escape the ISP block — otherwise keeping them "direct"
+/// (the default, which avoids flaky-relay "Failed to apply critical settings")
+/// sends them straight into the block and the game won't launch.
+pub async fn apply_bootstrap_overrides(country_ban_bypass: bool) -> Result<(), String> {
     let overrides = resolve_bootstrap_overrides().await?;
-    let active_ips: HashMap<Ipv4Addr, String> = overrides
-        .iter()
-        .map(|entry| (entry.ip, entry.domain.clone()))
-        .collect();
+    let (active_ips, direct_only_ips) = classify_bootstrap_ips(&overrides, country_ban_bypass);
 
     tokio::task::spawn_blocking(move || write_overrides(&overrides))
         .await
         .map_err(|e| format!("Failed to join hosts repair task: {e}"))??;
 
+    COUNTRY_BAN_BYPASS_ROUTING.store(country_ban_bypass, Ordering::Relaxed);
     set_active_bootstrap_ips(active_ips);
+    set_direct_only_bootstrap_ips(direct_only_ips);
     Ok(())
 }
 
-/// Whether `ip` is one of the currently-applied bootstrap override IPs. Used by
-/// the packet classifier to allow Route Assist TCP SYNs to those IPs.
+/// Split resolved overrides into (route-assist active, direct-only) IP sets.
+///
+/// When bypassing a country ban, nothing is direct-only — every bootstrap IP
+/// (including the launch-critical hosts) is routed through Route Assist so it
+/// can escape the block. Otherwise the launch-critical hosts stay direct.
+fn classify_bootstrap_ips(
+    overrides: &[HostOverride],
+    country_ban_bypass: bool,
+) -> (HashMap<Ipv4Addr, String>, HashSet<Ipv4Addr>) {
+    if country_ban_bypass {
+        let all: HashMap<Ipv4Addr, String> = overrides
+            .iter()
+            .map(|entry| (entry.ip, entry.domain.clone()))
+            .collect();
+        (all, HashSet::new())
+    } else {
+        (
+            route_assist_active_ips_from_overrides(overrides),
+            direct_only_ips_from_overrides(overrides),
+        )
+    }
+}
+
+/// Whether `ip` is one of the currently-applied Route Assist bootstrap IPs.
 pub fn is_active_bootstrap_ip(ip: Ipv4Addr) -> bool {
     active_bootstrap_ips()
         .read()
         .map(|ips| ips.contains_key(&ip))
         .unwrap_or(false)
+}
+
+/// Whether `ip` is a launch-critical bootstrap IP that must stay direct
+/// (not relayed) to avoid "Failed to apply critical settings" errors.
+pub fn is_direct_only_bootstrap_ip(ip: Ipv4Addr) -> bool {
+    direct_only_bootstrap_ips()
+        .read()
+        .map(|ips| ips.contains(&ip))
+        .unwrap_or(false)
+}
+
+/// Record that `ip` serves a launch-critical direct-only host, learned from the
+/// TLS SNI of a flow Route Assist had already relayed (because the connect-time
+/// hosts pin for that domain was missing, or system DNS picked a shared CDN
+/// edge that was pinned as active for another Roblox host).
+///
+/// The flow that taught us keeps its current route — half-moving an established
+/// TCP connection would break it. Only NEW connections to `ip` go direct, which
+/// is exactly what a Roblox bootstrapper's retry needs.
+///
+/// Returns `true` only when `ip` was newly recorded. Returns `false` (and
+/// learns nothing) when `server_name` is not one of the exact
+/// `DIRECT_ONLY_BOOTSTRAP_DOMAINS`, or while country-ban bypass is active.
+pub fn learn_direct_only_bootstrap_ip(server_name: &str, ip: Ipv4Addr) -> bool {
+    if !is_direct_only_bootstrap_domain(server_name) {
+        return false;
+    }
+    if COUNTRY_BAN_BYPASS_ROUTING.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let newly_learned = match direct_only_bootstrap_ips().write() {
+        Ok(mut direct_only) => direct_only.insert(ip),
+        Err(e) => {
+            warn!("Failed to learn direct-only Roblox bootstrap IP {ip}: {e}");
+            return false;
+        }
+    };
+
+    if newly_learned {
+        // Keep the invariant: direct-only wins, so a shared CDN edge must not
+        // stay in the route-assist active set.
+        match active_bootstrap_ips().write() {
+            Ok(mut active) => {
+                active.remove(&ip);
+            }
+            Err(e) => warn!("Failed to demote shared bootstrap IP {ip} from active set: {e}"),
+        }
+    }
+
+    newly_learned
 }
 
 /// Resolved bootstrap hostname for an IP, if any (for the URL log).
@@ -136,47 +257,44 @@ async fn resolve_bootstrap_overrides() -> Result<Vec<HostOverride>, String> {
         .build()
         .map_err(|e| format!("Failed to build DNS repair client: {e}"))?;
 
-    // Resolve all bootstrap domains concurrently with a hard total deadline.
-    // Uses a JoinSet rather than `futures_util` to avoid an extra dependency.
-    let mut set: tokio::task::JoinSet<(&'static str, Result<Ipv4Addr, String>)> =
-        tokio::task::JoinSet::new();
-    for domain in ROBLOX_BOOTSTRAP_DOMAINS {
-        let client = client.clone();
-        let domain = *domain;
-        set.spawn(async move { (domain, resolve_domain_ipv4(&client, domain).await) });
-    }
-
     let mut overrides = Vec::new();
     let mut failures = Vec::new();
-    let total_deadline = tokio::time::sleep(DNS_REPAIR_TOTAL_TIMEOUT);
-    tokio::pin!(total_deadline);
 
-    loop {
-        tokio::select! {
-            biased;
+    resolve_domains_with_timeout(
+        &client,
+        ROBLOX_BOOTSTRAP_DOMAINS,
+        DNS_REPAIR_TOTAL_TIMEOUT,
+        &mut overrides,
+        &mut failures,
+    )
+    .await;
 
-            joined = set.join_next() => {
-                match joined {
-                    Some(Ok((domain, Ok(ip)))) => overrides.push(HostOverride {
-                        ip,
-                        domain: domain.to_string(),
-                    }),
-                    Some(Ok((_domain, Err(e)))) => failures.push(e),
-                    Some(Err(e)) => failures.push(format!("DNS task join error: {e}")),
-                    None => break,
-                }
-            }
-            _ = &mut total_deadline => {
-                let remaining = set.len();
-                if remaining > 0 {
-                    failures.push(format!(
-                        "{} Roblox bootstrap DNS lookup(s) exceeded {}s total timeout",
-                        remaining,
-                        DNS_REPAIR_TOTAL_TIMEOUT.as_secs()
-                    ));
-                }
-                break;
-            }
+    // The direct-only hosts are the ones a missing pin actually hurts: without
+    // their IPs published, Route Assist can relay the launch-critical settings
+    // fetches it is supposed to keep direct. Give just those hosts one more
+    // bounded pass before giving up on them.
+    let missing = missing_direct_only_domains(&overrides);
+    if !overrides.is_empty() && !missing.is_empty() {
+        warn!(
+            "Retrying DNS repair for launch-critical Roblox host(s): {}",
+            missing.join(", ")
+        );
+        resolve_domains_with_timeout(
+            &client,
+            &missing,
+            DIRECT_ONLY_RETRY_TOTAL_TIMEOUT,
+            &mut overrides,
+            &mut failures,
+        )
+        .await;
+
+        let still_missing = missing_direct_only_domains(&overrides);
+        if !still_missing.is_empty() {
+            warn!(
+                "Launch-critical Roblox settings host(s) unpinned after retry: {}; \
+                 Route Assist will learn their IPs from TLS SNI at runtime",
+                still_missing.join(", ")
+            );
         }
     }
 
@@ -194,7 +312,91 @@ async fn resolve_bootstrap_overrides() -> Result<Vec<HostOverride>, String> {
     Ok(overrides)
 }
 
-async fn resolve_domain_ipv4(client: &reqwest::Client, domain: &str) -> Result<Ipv4Addr, String> {
+/// Resolve a slice of domains under `total_timeout`, appending successes to
+/// `overrides` and failure descriptions to `failures`.
+async fn resolve_domains_with_timeout(
+    client: &reqwest::Client,
+    domains: &[&'static str],
+    total_timeout: Duration,
+    overrides: &mut Vec<HostOverride>,
+    failures: &mut Vec<String>,
+) {
+    let mut set: tokio::task::JoinSet<(&'static str, Result<Vec<Ipv4Addr>, String>)> =
+        tokio::task::JoinSet::new();
+    for domain in domains {
+        let client = client.clone();
+        let domain = *domain;
+        set.spawn(async move { (domain, resolve_reachable_domain_ips(&client, domain).await) });
+    }
+
+    let deadline = tokio::time::sleep(total_timeout);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            biased;
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((domain, Ok(ips)))) => {
+                        for ip in ips {
+                            overrides.push(HostOverride { ip, domain: domain.to_string() });
+                        }
+                    }
+                    Some(Ok((_domain, Err(e)))) => failures.push(e),
+                    Some(Err(e)) => failures.push(format!("DNS task join error: {e}")),
+                    None => break,
+                }
+            }
+            _ = &mut deadline => {
+                let remaining = set.len();
+                if remaining > 0 {
+                    failures.push(format!(
+                        "{} Roblox bootstrap DNS lookup(s) exceeded {}s total timeout",
+                        remaining,
+                        total_timeout.as_secs()
+                    ));
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Direct-only domains that have no resolved override yet.
+fn missing_direct_only_domains(overrides: &[HostOverride]) -> Vec<&'static str> {
+    DIRECT_ONLY_BOOTSTRAP_DOMAINS
+        .iter()
+        .filter(|domain| {
+            !overrides
+                .iter()
+                .any(|entry| entry.domain.eq_ignore_ascii_case(domain))
+        })
+        .copied()
+        .collect()
+}
+
+/// Resolve a domain and keep only the IPs that are actually reachable on :443
+/// from this machine, preserving DNS preference order.
+async fn resolve_reachable_domain_ips(
+    client: &reqwest::Client,
+    domain: &str,
+) -> Result<Vec<Ipv4Addr>, String> {
+    let candidates = resolve_domain_ips(client, domain).await?;
+    let reachable = filter_reachable_ips(candidates).await;
+    if reachable.is_empty() {
+        return Err(format!(
+            "{domain} resolved but no IP answered on :{ROBLOX_HTTPS_PORT}"
+        ));
+    }
+    Ok(reachable)
+}
+
+/// Resolve a domain to up to `MAX_PINNED_IPS_PER_DOMAIN` usable public IPv4s
+/// via DNS-over-HTTPS.
+async fn resolve_domain_ips(
+    client: &reqwest::Client,
+    domain: &str,
+) -> Result<Vec<Ipv4Addr>, String> {
     let mut failures = Vec::new();
 
     for resolver in DNS_REPAIR_RESOLVERS {
@@ -205,7 +407,7 @@ async fn resolve_domain_ipv4(client: &reqwest::Client, domain: &str) -> Result<I
             .send()
             .await
         {
-            Ok(response) => response,
+            Ok(r) => r,
             Err(e) => {
                 failures.push(format!("{resolver}: request failed: {e}"));
                 continue;
@@ -218,7 +420,7 @@ async fn resolve_domain_ipv4(client: &reqwest::Client, domain: &str) -> Result<I
         }
 
         let body = match response.text().await {
-            Ok(body) => body,
+            Ok(b) => b,
             Err(e) => {
                 failures.push(format!("{resolver}: response read failed: {e}"));
                 continue;
@@ -226,7 +428,9 @@ async fn resolve_domain_ipv4(client: &reqwest::Client, domain: &str) -> Result<I
         };
 
         match parse_usable_a_records(&body) {
-            Ok(ips) if !ips.is_empty() => return Ok(ips[0]),
+            Ok(ips) if !ips.is_empty() => {
+                return Ok(dedup_and_cap_ips(ips, MAX_PINNED_IPS_PER_DOMAIN));
+            }
             Ok(_) => failures.push(format!("{resolver}: no usable public A records")),
             Err(e) => failures.push(format!("{resolver}: {e}")),
         }
@@ -238,13 +442,68 @@ async fn resolve_domain_ipv4(client: &reqwest::Client, domain: &str) -> Result<I
     ))
 }
 
+/// Deduplicate IPs (preserving first-seen order) and cap the count.
+fn dedup_and_cap_ips(ips: Vec<Ipv4Addr>, cap: usize) -> Vec<Ipv4Addr> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for ip in ips {
+        if seen.insert(ip) {
+            out.push(ip);
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Probe each candidate IP on :443 concurrently and return the reachable ones,
+/// preserving the original DNS-preference order.
+async fn filter_reachable_ips(ips: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
+    filter_reachable_ips_on_port(ips, ROBLOX_HTTPS_PORT).await
+}
+
+async fn filter_reachable_ips_on_port(ips: Vec<Ipv4Addr>, port: u16) -> Vec<Ipv4Addr> {
+    if ips.is_empty() {
+        return Vec::new();
+    }
+
+    let mut set: tokio::task::JoinSet<(usize, Ipv4Addr, bool)> = tokio::task::JoinSet::new();
+    for (idx, ip) in ips.into_iter().enumerate() {
+        set.spawn(async move { (idx, ip, probe_tcp_reachable(ip, port).await) });
+    }
+
+    let mut reachable: Vec<(usize, Ipv4Addr)> = Vec::new();
+    while let Some(result) = set.join_next().await {
+        if let Ok((idx, ip, true)) = result {
+            reachable.push((idx, ip));
+        }
+    }
+
+    reachable.sort_by_key(|(idx, _)| *idx);
+    reachable.into_iter().map(|(_, ip)| ip).collect()
+}
+
+/// Returns `true` if a TCP connection to `ip:port` completes within the probe
+/// timeout.
+async fn probe_tcp_reachable(ip: Ipv4Addr, port: u16) -> bool {
+    let addr = SocketAddr::from((ip, port));
+    matches!(
+        tokio::time::timeout(
+            REACHABILITY_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 fn write_overrides(overrides: &[HostOverride]) -> Result<(), String> {
     if overrides.is_empty() {
         return Err("No hosts overrides to write".to_string());
     }
 
     let path = hosts_path();
-
     let content =
         fs::read_to_string(&path).map_err(|e| format!("Failed to read hosts file: {e}"))?;
 
@@ -272,13 +531,12 @@ fn write_overrides(overrides: &[HostOverride]) -> Result<(), String> {
 /// startup recovery and `Drop`.
 pub fn remove_overrides() -> Result<(), String> {
     let result = remove_overrides_inner();
-    clear_active_bootstrap_ips();
+    clear_bootstrap_ip_sets();
     result
 }
 
 fn remove_overrides_inner() -> Result<(), String> {
     let path = hosts_path();
-
     let content =
         fs::read_to_string(&path).map_err(|e| format!("Failed to read hosts file: {e}"))?;
 
@@ -316,8 +574,16 @@ pub fn has_overrides() -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Statics helpers
+// ---------------------------------------------------------------------------
+
 fn active_bootstrap_ips() -> &'static RwLock<HashMap<Ipv4Addr, String>> {
     ACTIVE_BOOTSTRAP_IPS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn direct_only_bootstrap_ips() -> &'static RwLock<HashSet<Ipv4Addr>> {
+    DIRECT_ONLY_BOOTSTRAP_IPS.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
 fn set_active_bootstrap_ips(ips: HashMap<Ipv4Addr, String>) {
@@ -327,10 +593,46 @@ fn set_active_bootstrap_ips(ips: HashMap<Ipv4Addr, String>) {
     }
 }
 
-fn clear_active_bootstrap_ips() {
+fn set_direct_only_bootstrap_ips(ips: HashSet<Ipv4Addr>) {
+    match direct_only_bootstrap_ips().write() {
+        Ok(mut direct_only) => *direct_only = ips,
+        Err(e) => warn!("Failed to publish direct-only Roblox bootstrap IPs: {e}"),
+    }
+}
+
+fn route_assist_active_ips_from_overrides(overrides: &[HostOverride]) -> HashMap<Ipv4Addr, String> {
+    let direct_only_ips = direct_only_ips_from_overrides(overrides);
+    overrides
+        .iter()
+        .filter(|entry| !is_direct_only_bootstrap_domain(&entry.domain))
+        .filter(|entry| !direct_only_ips.contains(&entry.ip))
+        .map(|entry| (entry.ip, entry.domain.clone()))
+        .collect()
+}
+
+fn direct_only_ips_from_overrides(overrides: &[HostOverride]) -> HashSet<Ipv4Addr> {
+    overrides
+        .iter()
+        .filter(|entry| is_direct_only_bootstrap_domain(&entry.domain))
+        .map(|entry| entry.ip)
+        .collect()
+}
+
+fn is_direct_only_bootstrap_domain(domain: &str) -> bool {
+    DIRECT_ONLY_BOOTSTRAP_DOMAINS
+        .iter()
+        .any(|d| domain.eq_ignore_ascii_case(d))
+}
+
+fn clear_bootstrap_ip_sets() {
+    COUNTRY_BAN_BYPASS_ROUTING.store(false, Ordering::Relaxed);
     match active_bootstrap_ips().write() {
         Ok(mut active) => active.clear(),
         Err(e) => warn!("Failed to clear Roblox bootstrap route IPs: {e}"),
+    }
+    match direct_only_bootstrap_ips().write() {
+        Ok(mut direct_only) => direct_only.clear(),
+        Err(e) => warn!("Failed to clear direct-only Roblox bootstrap IPs: {e}"),
     }
 }
 
@@ -338,7 +640,6 @@ fn clear_active_bootstrap_ips() {
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Remove the marker-delimited block from the hosts file content.
 fn remove_marker_block(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
     let mut inside_block = false;
@@ -401,8 +702,8 @@ fn parse_usable_a_records(body: &str) -> Result<Vec<Ipv4Addr>, String> {
     Ok(response
         .answer
         .into_iter()
-        .filter(|answer| answer.record_type == 1)
-        .filter_map(|answer| answer.data.parse::<Ipv4Addr>().ok())
+        .filter(|a| a.record_type == 1)
+        .filter_map(|a| a.data.parse::<Ipv4Addr>().ok())
         .filter(|ip| is_usable_public_ipv4(*ip))
         .collect())
 }
@@ -424,7 +725,6 @@ fn is_usable_public_ipv4(ip: Ipv4Addr) -> bool {
         || (octets[0] == 198 && (18..=19).contains(&octets[1])))
 }
 
-/// Flush the Windows DNS resolver cache (`ipconfig /flushdns`).
 #[cfg(windows)]
 fn flush_dns_cache() {
     use std::os::windows::process::CommandExt;
@@ -446,6 +746,39 @@ fn flush_dns_cache() {
 
 #[cfg(not(windows))]
 fn flush_dns_cache() {}
+
+// ---------------------------------------------------------------------------
+// Test helpers (pub(crate) so interceptor tests can seed the state)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn set_active_bootstrap_ips_for_test(ips: impl IntoIterator<Item = Ipv4Addr>) {
+    set_active_bootstrap_ips(
+        ips.into_iter()
+            .map(|ip| (ip, "test.roblox.com".to_string()))
+            .collect(),
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn set_direct_only_bootstrap_ips_for_test(ips: impl IntoIterator<Item = Ipv4Addr>) {
+    set_direct_only_bootstrap_ips(ips.into_iter().collect());
+}
+
+#[cfg(test)]
+pub(crate) fn clear_active_bootstrap_ips_for_test() {
+    clear_bootstrap_ip_sets();
+}
+
+#[cfg(test)]
+pub(crate) fn set_country_ban_bypass_routing_for_test(active: bool) {
+    COUNTRY_BAN_BYPASS_ROUTING.store(active, Ordering::Relaxed);
+}
+
+/// Serializes every test that touches the process-global bootstrap IP sets.
+/// Tests must hold this for their entire mutate-assert-clear sequence.
+#[cfg(test)]
+pub(crate) static BOOTSTRAP_IP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -476,10 +809,170 @@ mod tests {
     }
 
     #[test]
-    fn build_doh_url_encodes_domain_query_value() {
+    fn direct_only_domains_are_subset_of_bootstrap_domains() {
+        for domain in DIRECT_ONLY_BOOTSTRAP_DOMAINS {
+            assert!(
+                ROBLOX_BOOTSTRAP_DOMAINS.contains(domain),
+                "{domain} is in DIRECT_ONLY but not in ROBLOX_BOOTSTRAP_DOMAINS"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_direct_only_domains_reports_unresolved_launch_hosts() {
         assert_eq!(
-            build_doh_url("https://1.1.1.1/dns-query", "clientsettingscdn.roblox.com"),
-            "https://1.1.1.1/dns-query?name=clientsettingscdn.roblox.com&type=A"
+            missing_direct_only_domains(&[]),
+            DIRECT_ONLY_BOOTSTRAP_DOMAINS.to_vec()
+        );
+
+        let overrides = vec![
+            HostOverride {
+                ip: Ipv4Addr::new(65, 9, 168, 80),
+                domain: "ClientSettingsCDN.Roblox.com".to_string(),
+            },
+            HostOverride {
+                ip: Ipv4Addr::new(128, 116, 46, 3),
+                domain: "clientsettings.roblox.com".to_string(),
+            },
+        ];
+        assert_eq!(
+            missing_direct_only_domains(&overrides),
+            vec![
+                "clientsettings.api.roblox.com",
+                "versioncompatibility.api.roblox.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn route_assist_active_ips_exclude_launch_critical_settings_hosts() {
+        let overrides = vec![
+            HostOverride {
+                ip: Ipv4Addr::new(65, 9, 168, 80),
+                domain: "clientsettingscdn.roblox.com".to_string(),
+            },
+            HostOverride {
+                ip: Ipv4Addr::new(128, 116, 46, 3),
+                domain: "clientsettings.roblox.com".to_string(),
+            },
+            HostOverride {
+                ip: Ipv4Addr::new(128, 116, 121, 3),
+                domain: "www.roblox.com".to_string(),
+            },
+        ];
+
+        let active = route_assist_active_ips_from_overrides(&overrides);
+        let direct_only = direct_only_ips_from_overrides(&overrides);
+
+        assert!(!active.contains_key(&Ipv4Addr::new(65, 9, 168, 80)));
+        assert!(!active.contains_key(&Ipv4Addr::new(128, 116, 46, 3)));
+        assert!(active.contains_key(&Ipv4Addr::new(128, 116, 121, 3)));
+        assert!(direct_only.contains(&Ipv4Addr::new(65, 9, 168, 80)));
+        assert!(direct_only.contains(&Ipv4Addr::new(128, 116, 46, 3)));
+        assert!(!direct_only.contains(&Ipv4Addr::new(128, 116, 121, 3)));
+    }
+
+    #[test]
+    fn country_bypass_routes_critical_hosts_through_relay() {
+        let critical = HostOverride {
+            ip: Ipv4Addr::new(128, 116, 46, 3),
+            domain: "clientsettings.roblox.com".to_string(),
+        };
+        let normal = HostOverride {
+            ip: Ipv4Addr::new(128, 116, 121, 3),
+            domain: "www.roblox.com".to_string(),
+        };
+        let overrides = vec![critical.clone(), normal.clone()];
+
+        let (active, direct_only) = classify_bootstrap_ips(&overrides, false);
+        assert!(direct_only.contains(&critical.ip));
+        assert!(!active.contains_key(&critical.ip));
+        assert!(active.contains_key(&normal.ip));
+
+        let (active, direct_only) = classify_bootstrap_ips(&overrides, true);
+        assert!(direct_only.is_empty());
+        assert!(active.contains_key(&critical.ip));
+        assert!(active.contains_key(&normal.ip));
+    }
+
+    #[test]
+    fn learn_direct_only_ip_records_settings_host_and_demotes_active_ip() {
+        let _guard = BOOTSTRAP_IP_TEST_LOCK.lock().unwrap();
+        clear_active_bootstrap_ips_for_test();
+
+        let shared_ip = Ipv4Addr::new(65, 9, 168, 90);
+        set_active_bootstrap_ips_for_test([shared_ip]);
+
+        assert!(learn_direct_only_bootstrap_ip(
+            "clientsettingscdn.roblox.com",
+            shared_ip
+        ));
+        assert!(is_direct_only_bootstrap_ip(shared_ip));
+        assert!(!is_active_bootstrap_ip(shared_ip));
+
+        assert!(!learn_direct_only_bootstrap_ip(
+            "clientsettingscdn.roblox.com",
+            shared_ip
+        ));
+
+        clear_active_bootstrap_ips_for_test();
+    }
+
+    #[test]
+    fn learn_direct_only_ip_rejects_non_direct_only_hosts() {
+        let _guard = BOOTSTRAP_IP_TEST_LOCK.lock().unwrap();
+        clear_active_bootstrap_ips_for_test();
+
+        let ip = Ipv4Addr::new(65, 9, 168, 91);
+        assert!(!learn_direct_only_bootstrap_ip("www.roblox.com", ip));
+        assert!(!learn_direct_only_bootstrap_ip("apis.roblox.com", ip));
+        assert!(!learn_direct_only_bootstrap_ip(
+            "clientsettingscdn.roblox.com.evil.test",
+            ip
+        ));
+        assert!(!is_direct_only_bootstrap_ip(ip));
+
+        clear_active_bootstrap_ips_for_test();
+    }
+
+    #[test]
+    fn learn_direct_only_ip_is_disabled_during_country_ban_bypass() {
+        let _guard = BOOTSTRAP_IP_TEST_LOCK.lock().unwrap();
+        clear_active_bootstrap_ips_for_test();
+        set_country_ban_bypass_routing_for_test(true);
+
+        let ip = Ipv4Addr::new(65, 9, 168, 92);
+        assert!(!learn_direct_only_bootstrap_ip(
+            "clientsettings.roblox.com",
+            ip
+        ));
+        assert!(!is_direct_only_bootstrap_ip(ip));
+
+        clear_active_bootstrap_ips_for_test();
+        assert!(learn_direct_only_bootstrap_ip(
+            "clientsettings.roblox.com",
+            ip
+        ));
+
+        clear_active_bootstrap_ips_for_test();
+    }
+
+    #[test]
+    fn dedup_and_cap_ips_preserves_order_and_caps() {
+        let ips = vec![
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(2, 2, 2, 2),
+            Ipv4Addr::new(3, 3, 3, 3),
+            Ipv4Addr::new(4, 4, 4, 4),
+        ];
+        assert_eq!(
+            dedup_and_cap_ips(ips, 3),
+            vec![
+                Ipv4Addr::new(1, 1, 1, 1),
+                Ipv4Addr::new(2, 2, 2, 2),
+                Ipv4Addr::new(3, 3, 3, 3),
+            ]
         );
     }
 
@@ -493,12 +986,38 @@ mod tests {
 
     #[test]
     fn active_bootstrap_ips_roundtrip() {
+        let _guard = BOOTSTRAP_IP_TEST_LOCK.lock().unwrap();
+        clear_active_bootstrap_ips_for_test();
+
         let ip = Ipv4Addr::new(65, 9, 168, 80);
         set_active_bootstrap_ips([(ip, "www.roblox.com".to_string())].into_iter().collect());
         assert!(is_active_bootstrap_ip(ip));
         assert_eq!(host_for_ip(ip).as_deref(), Some("www.roblox.com"));
         assert!(!is_active_bootstrap_ip(Ipv4Addr::new(65, 9, 168, 81)));
-        clear_active_bootstrap_ips();
+
+        clear_active_bootstrap_ips_for_test();
         assert!(!is_active_bootstrap_ip(ip));
+    }
+
+    #[test]
+    fn direct_only_bootstrap_ips_roundtrip() {
+        let _guard = BOOTSTRAP_IP_TEST_LOCK.lock().unwrap();
+        clear_active_bootstrap_ips_for_test();
+
+        let ip = Ipv4Addr::new(128, 116, 46, 3);
+        set_direct_only_bootstrap_ips([ip].into_iter().collect());
+        assert!(is_direct_only_bootstrap_ip(ip));
+        assert!(!is_direct_only_bootstrap_ip(Ipv4Addr::new(128, 116, 46, 4)));
+
+        clear_active_bootstrap_ips_for_test();
+        assert!(!is_direct_only_bootstrap_ip(ip));
+    }
+
+    #[test]
+    fn build_doh_url_encodes_domain_query_value() {
+        assert_eq!(
+            build_doh_url("https://1.1.1.1/dns-query", "clientsettingscdn.roblox.com"),
+            "https://1.1.1.1/dns-query?name=clientsettingscdn.roblox.com&type=A"
+        );
     }
 }

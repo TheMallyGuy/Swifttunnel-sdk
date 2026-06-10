@@ -64,6 +64,12 @@ struct ConnectExOptions {
     /// bootstrap DNS (helps bypass network/country bans).
     #[serde(default)]
     enable_api_tunneling: bool,
+    /// Bypass Country Bans: launch GoodbyeDPI and route ALL Roblox bootstrap
+    /// traffic (including the launch-critical hosts normally kept direct)
+    /// through Route Assist so geo-blocked connections can escape the ISP block.
+    /// Implicitly enables `enable_api_tunneling`.
+    #[serde(default)]
+    enable_country_ban: bool,
     /// URLs/hosts to never tunnel. Each is resolved to IPs at connect time and
     /// any traffic to those IPs always bypasses the relay.
     #[serde(default)]
@@ -166,11 +172,12 @@ fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 
         options.auto_routing.enabled,
         available_servers,
         options.auto_routing.whitelisted_regions,
-        options.enable_api_tunneling,
+        options.enable_api_tunneling || options.enable_country_ban,
         options.excluded_urls,
         options.asset_relay_server,
         options.asset_urls,
         options.asset_relay_count,
+        options.enable_country_ban,
     )) {
         Ok(()) => SUCCESS,
         Err(e) => {
@@ -620,6 +627,7 @@ pub unsafe extern "C" fn swifttunnel_connect(
         asset_relay_server: None,
         asset_urls: Vec::new(),
         asset_relay_count: 0,
+        enable_country_ban: false,
     };
 
     let mut guard = SDK.lock();
