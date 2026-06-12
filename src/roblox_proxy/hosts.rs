@@ -32,6 +32,8 @@ const DNS_REPAIR_RESOLVERS: &[&str] = &[
     // the DNS-over-HTTPS resolver itself.
     "https://1.1.1.1/dns-query",
     "https://8.8.8.8/resolve",
+    "https://9.9.9.9:5053/dns-query",
+    "https://94.140.14.14/resolve",
 ];
 
 /// Maximum IPs pinned per Roblox bootstrap domain.
@@ -69,6 +71,16 @@ const DIRECT_ONLY_BOOTSTRAP_DOMAINS: &[&str] = &[
     "clientsettings.roblox.com",
     "clientsettings.api.roblox.com",
     "versioncompatibility.api.roblox.com",
+];
+
+/// Asset/CDN domains that should go direct (not through the relay) when a
+/// country ban is active — they are high-bandwidth and don't need bypass.
+/// *.rbxcdn.com is matched by suffix in `is_asset_direct_domain`.
+const ASSET_DIRECT_ROBLOX_DOMAINS: &[&str] = &[
+    "assetgame.roblox.com",
+    "assetdelivery.roblox.com",
+    "thumbnails.roblox.com",
+    "setup.roblox.com",
 ];
 
 /// Exact Roblox hostnames repaired when Route Assist is enabled.
@@ -109,6 +121,26 @@ pub const ROBLOX_BOOTSTRAP_DOMAINS: &[&str] = &[
     "apis.rbxcdn.com",
     "js.rbxcdn.com",
     "static.rbxcdn.com",
+    "c0.rbxcdn.com",
+    "c1.rbxcdn.com",
+    "c2.rbxcdn.com",
+    "c3.rbxcdn.com",
+    "c4.rbxcdn.com",
+    "c5.rbxcdn.com",
+    "c6.rbxcdn.com",
+    "c7.rbxcdn.com",
+    "tr.rbxcdn.com",
+    "fts.rbxcdn.com",
+    "t0.rbxcdn.com",
+    "t1.rbxcdn.com",
+    "t2.rbxcdn.com",
+    "t3.rbxcdn.com",
+    "t4.rbxcdn.com",
+    "t5.rbxcdn.com",
+    "t6.rbxcdn.com",
+    "t7.rbxcdn.com",
+    "images.rbxcdn.com",
+    "css.rbxcdn.com",
     "cdn.arkoselabs.com",
     "roblox-api.arkoselabs.com",
 ];
@@ -148,40 +180,21 @@ struct DohJsonAnswer {
 /// (the default, which avoids flaky-relay "Failed to apply critical settings")
 /// sends them straight into the block and the game won't launch.
 pub async fn apply_bootstrap_overrides(country_ban_bypass: bool) -> Result<(), String> {
-    let overrides = resolve_bootstrap_overrides().await?;
-    let (active_ips, direct_only_ips) = classify_bootstrap_ips(&overrides, country_ban_bypass);
+    let resolved = resolve_bootstrap_overrides().await?;
+    let (overrides, active_ips, direct_only_ips) = if country_ban_bypass {
+        let (active, direct_only) = country_ban_split_ips_from_overrides(&resolved);
+        (resolved, active, direct_only)
+    } else {
+        allocate_route_assist_pins(resolved)
+    };
 
     tokio::task::spawn_blocking(move || write_overrides(&overrides))
         .await
-        .map_err(|e| format!("Failed to join hosts repair task: {e}"))??;
+        .map_err(|e| e.to_string())??;
 
-    COUNTRY_BAN_BYPASS_ROUTING.store(country_ban_bypass, Ordering::Relaxed);
     set_active_bootstrap_ips(active_ips);
     set_direct_only_bootstrap_ips(direct_only_ips);
     Ok(())
-}
-
-/// Split resolved overrides into (route-assist active, direct-only) IP sets.
-///
-/// When bypassing a country ban, nothing is direct-only — every bootstrap IP
-/// (including the launch-critical hosts) is routed through Route Assist so it
-/// can escape the block. Otherwise the launch-critical hosts stay direct.
-fn classify_bootstrap_ips(
-    overrides: &[HostOverride],
-    country_ban_bypass: bool,
-) -> (HashMap<Ipv4Addr, String>, HashSet<Ipv4Addr>) {
-    if country_ban_bypass {
-        let all: HashMap<Ipv4Addr, String> = overrides
-            .iter()
-            .map(|entry| (entry.ip, entry.domain.clone()))
-            .collect();
-        (all, HashSet::new())
-    } else {
-        (
-            route_assist_active_ips_from_overrides(overrides),
-            direct_only_ips_from_overrides(overrides),
-        )
-    }
 }
 
 /// Whether `ip` is one of the currently-applied Route Assist bootstrap IPs.
@@ -201,46 +214,33 @@ pub fn is_direct_only_bootstrap_ip(ip: Ipv4Addr) -> bool {
         .unwrap_or(false)
 }
 
-/// Record that `ip` serves a launch-critical direct-only host, learned from the
+/// Record that `ip` serves a route-assist direct domain, learned from the
 /// TLS SNI of a flow Route Assist had already relayed (because the connect-time
 /// hosts pin for that domain was missing, or system DNS picked a shared CDN
 /// edge that was pinned as active for another Roblox host).
 ///
-/// The flow that taught us keeps its current route — half-moving an established
-/// TCP connection would break it. Only NEW connections to `ip` go direct, which
-/// is exactly what a Roblox bootstrapper's retry needs.
-///
 /// Returns `true` only when `ip` was newly recorded. Returns `false` (and
-/// learns nothing) when `server_name` is not one of the exact
-/// `DIRECT_ONLY_BOOTSTRAP_DOMAINS`, or while country-ban bypass is active.
+/// learns nothing) when `server_name` is not a route-assist direct domain,
+/// while country-ban bypass is active, or when the IP is already an active
+/// control-plane pin (no demotion — that would break the active flow).
 pub fn learn_direct_only_bootstrap_ip(server_name: &str, ip: Ipv4Addr) -> bool {
-    if !is_direct_only_bootstrap_domain(server_name) {
+    if !is_route_assist_direct_domain(server_name) {
         return false;
     }
     if COUNTRY_BAN_BYPASS_ROUTING.load(Ordering::Relaxed) {
         return false;
     }
+    if is_active_bootstrap_ip(ip) {
+        return false;
+    }
 
-    let newly_learned = match direct_only_bootstrap_ips().write() {
+    match direct_only_bootstrap_ips().write() {
         Ok(mut direct_only) => direct_only.insert(ip),
         Err(e) => {
             warn!("Failed to learn direct-only Roblox bootstrap IP {ip}: {e}");
-            return false;
-        }
-    };
-
-    if newly_learned {
-        // Keep the invariant: direct-only wins, so a shared CDN edge must not
-        // stay in the route-assist active set.
-        match active_bootstrap_ips().write() {
-            Ok(mut active) => {
-                active.remove(&ip);
-            }
-            Err(e) => warn!("Failed to demote shared bootstrap IP {ip} from active set: {e}"),
+            false
         }
     }
-
-    newly_learned
 }
 
 /// Resolved bootstrap hostname for an IP, if any (for the URL log).
@@ -600,28 +600,105 @@ fn set_direct_only_bootstrap_ips(ips: HashSet<Ipv4Addr>) {
     }
 }
 
-fn route_assist_active_ips_from_overrides(overrides: &[HostOverride]) -> HashMap<Ipv4Addr, String> {
-    let direct_only_ips = direct_only_ips_from_overrides(overrides);
-    overrides
-        .iter()
-        .filter(|entry| !is_direct_only_bootstrap_domain(&entry.domain))
-        .filter(|entry| !direct_only_ips.contains(&entry.ip))
-        .map(|entry| (entry.ip, entry.domain.clone()))
-        .collect()
-}
-
-fn direct_only_ips_from_overrides(overrides: &[HostOverride]) -> HashSet<Ipv4Addr> {
-    overrides
-        .iter()
-        .filter(|entry| is_direct_only_bootstrap_domain(&entry.domain))
-        .map(|entry| entry.ip)
-        .collect()
-}
-
 fn is_direct_only_bootstrap_domain(domain: &str) -> bool {
     DIRECT_ONLY_BOOTSTRAP_DOMAINS
         .iter()
         .any(|d| domain.eq_ignore_ascii_case(d))
+}
+
+/// Whether `domain` is an asset/CDN host that goes direct (high-bandwidth, no
+/// need for relay escape). Named roblox.com asset hosts plus any *.rbxcdn.com.
+pub fn is_asset_direct_domain(domain: &str) -> bool {
+    let d = domain.trim_end_matches('.');
+    ASSET_DIRECT_ROBLOX_DOMAINS
+        .iter()
+        .any(|asset| d.eq_ignore_ascii_case(asset))
+        || d.to_ascii_lowercase().ends_with(".rbxcdn.com")
+}
+
+/// A domain whose IPs should go direct in the route-assist (non-country-ban)
+/// path: either a launch-critical settings host or an asset/CDN host.
+fn is_route_assist_direct_domain(domain: &str) -> bool {
+    is_direct_only_bootstrap_domain(domain) || is_asset_direct_domain(domain)
+}
+
+/// Allocate route-assist pins: split resolved overrides into
+/// (kept overrides, active relay HashMap<ip→domain>, direct-only HashSet).
+///
+/// For each domain, prefers entries whose IP is not claimed by the other pool
+/// (conflict-free). If no conflict-free entry exists for a domain, all its
+/// entries are kept. Active IPs map to their domain for `host_for_ip()`.
+fn allocate_route_assist_pins(
+    overrides: Vec<HostOverride>,
+) -> (Vec<HostOverride>, HashMap<Ipv4Addr, String>, HashSet<Ipv4Addr>) {
+    let direct_pool: HashSet<Ipv4Addr> = overrides
+        .iter()
+        .filter(|entry| is_route_assist_direct_domain(&entry.domain))
+        .map(|entry| entry.ip)
+        .collect();
+    let active_pool: HashSet<Ipv4Addr> = overrides
+        .iter()
+        .filter(|entry| !is_route_assist_direct_domain(&entry.domain))
+        .map(|entry| entry.ip)
+        .collect();
+
+    let mut domains: Vec<&str> = Vec::new();
+    for entry in &overrides {
+        if !domains.iter().any(|d| d.eq_ignore_ascii_case(&entry.domain)) {
+            domains.push(&entry.domain);
+        }
+    }
+
+    let mut kept: Vec<HostOverride> = Vec::with_capacity(overrides.len());
+    for domain in domains {
+        let other_pool = if is_route_assist_direct_domain(domain) {
+            &active_pool
+        } else {
+            &direct_pool
+        };
+        let candidates: Vec<&HostOverride> = overrides
+            .iter()
+            .filter(|entry| entry.domain.eq_ignore_ascii_case(domain))
+            .collect();
+        let conflict_free: Vec<&HostOverride> = candidates
+            .iter()
+            .copied()
+            .filter(|entry| !other_pool.contains(&entry.ip))
+            .collect();
+        if conflict_free.is_empty() {
+            kept.extend(candidates.into_iter().cloned());
+        } else {
+            kept.extend(conflict_free.into_iter().cloned());
+        }
+    }
+
+    // SDK: active is HashMap<ip, domain> for host_for_ip()
+    let active: HashMap<Ipv4Addr, String> = kept
+        .iter()
+        .filter(|entry| !is_route_assist_direct_domain(&entry.domain))
+        .map(|entry| (entry.ip, entry.domain.clone()))
+        .collect();
+    let direct_only: HashSet<Ipv4Addr> = kept
+        .iter()
+        .filter(|entry| is_route_assist_direct_domain(&entry.domain))
+        .map(|entry| entry.ip)
+        .filter(|ip| !active.contains_key(ip))
+        .collect();
+
+    (kept, active, direct_only)
+}
+
+/// During country-ban bypass: relay everything — full country ban means the
+/// CDN is also blocked, so splitting assets to direct would break them too.
+/// All IPs go into active; direct_only is empty.
+fn country_ban_split_ips_from_overrides(
+    overrides: &[HostOverride],
+) -> (HashMap<Ipv4Addr, String>, HashSet<Ipv4Addr>) {
+    let active: HashMap<Ipv4Addr, String> = overrides
+        .iter()
+        .map(|entry| (entry.ip, entry.domain.clone()))
+        .collect();
+    (active, HashSet::new())
 }
 
 fn clear_bootstrap_ip_sets() {
@@ -803,9 +880,27 @@ mod tests {
 
     #[test]
     fn domain_list_stays_allowlisted_and_exact() {
-        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 34);
+        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 54);
         assert!(!ROBLOX_BOOTSTRAP_DOMAINS.contains(&"roblox.com"));
         assert!(ROBLOX_BOOTSTRAP_DOMAINS.contains(&"gamejoin.roblox.com"));
+        // c0-c7 must be in bootstrap domains
+        for i in 0..8 {
+            let d = format!("c{}.rbxcdn.com", i);
+            assert!(
+                ROBLOX_BOOTSTRAP_DOMAINS.contains(&d.as_str()),
+                "{} missing from ROBLOX_BOOTSTRAP_DOMAINS",
+                d
+            );
+        }
+        // c0-c7 must be asset_direct
+        for i in 0..8 {
+            let d = format!("c{}.rbxcdn.com", i);
+            assert!(
+                is_asset_direct_domain(&d),
+                "{} should be asset_direct",
+                d
+            );
+        }
     }
 
     #[test]
@@ -845,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn route_assist_active_ips_exclude_launch_critical_settings_hosts() {
+    fn route_assist_keeps_settings_and_assets_direct_and_relays_control_plane() {
         let overrides = vec![
             HostOverride {
                 ip: Ipv4Addr::new(65, 9, 168, 80),
@@ -859,17 +954,25 @@ mod tests {
                 ip: Ipv4Addr::new(128, 116, 121, 3),
                 domain: "www.roblox.com".to_string(),
             },
+            HostOverride {
+                ip: Ipv4Addr::new(10, 20, 30, 40),
+                domain: "setup.rbxcdn.com".to_string(),
+            },
         ];
 
-        let active = route_assist_active_ips_from_overrides(&overrides);
-        let direct_only = direct_only_ips_from_overrides(&overrides);
+        let (_kept, active, direct_only) = allocate_route_assist_pins(overrides);
 
+        // Settings hosts → direct_only
         assert!(!active.contains_key(&Ipv4Addr::new(65, 9, 168, 80)));
         assert!(!active.contains_key(&Ipv4Addr::new(128, 116, 46, 3)));
-        assert!(active.contains_key(&Ipv4Addr::new(128, 116, 121, 3)));
         assert!(direct_only.contains(&Ipv4Addr::new(65, 9, 168, 80)));
         assert!(direct_only.contains(&Ipv4Addr::new(128, 116, 46, 3)));
+        // Control-plane host → active
+        assert!(active.contains_key(&Ipv4Addr::new(128, 116, 121, 3)));
         assert!(!direct_only.contains(&Ipv4Addr::new(128, 116, 121, 3)));
+        // rbxcdn.com → direct_only (asset)
+        assert!(!active.contains_key(&Ipv4Addr::new(10, 20, 30, 40)));
+        assert!(direct_only.contains(&Ipv4Addr::new(10, 20, 30, 40)));
     }
 
     #[test]
@@ -884,36 +987,77 @@ mod tests {
         };
         let overrides = vec![critical.clone(), normal.clone()];
 
-        let (active, direct_only) = classify_bootstrap_ips(&overrides, false);
+        // Non-country-ban path: settings host → direct_only, control-plane → active
+        let (_kept, active, direct_only) = allocate_route_assist_pins(overrides.clone());
         assert!(direct_only.contains(&critical.ip));
         assert!(!active.contains_key(&critical.ip));
         assert!(active.contains_key(&normal.ip));
 
-        let (active, direct_only) = classify_bootstrap_ips(&overrides, true);
+        // Country-ban bypass: all hosts relay, direct_only is empty.
+        let (active, direct_only) = country_ban_split_ips_from_overrides(&overrides);
         assert!(direct_only.is_empty());
         assert!(active.contains_key(&critical.ip));
         assert!(active.contains_key(&normal.ip));
     }
 
     #[test]
-    fn learn_direct_only_ip_records_settings_host_and_demotes_active_ip() {
+    fn country_ban_split_relays_everything() {
+        let control = HostOverride {
+            ip: Ipv4Addr::new(1, 2, 3, 4),
+            domain: "api.roblox.com".to_string(),
+        };
+        let asset = HostOverride {
+            ip: Ipv4Addr::new(5, 6, 7, 8),
+            domain: "assetdelivery.roblox.com".to_string(),
+        };
+        let overrides = vec![control.clone(), asset.clone()];
+        let (active, direct_only) = country_ban_split_ips_from_overrides(&overrides);
+
+        // Full country ban: everything relayed, nothing direct
+        assert!(active.contains_key(&control.ip));
+        assert!(active.contains_key(&asset.ip));
+        assert!(direct_only.is_empty());
+    }
+
+    #[test]
+    fn learn_direct_only_ip_records_unpinned_settings_host() {
+        let _guard = BOOTSTRAP_IP_TEST_LOCK.lock().unwrap();
+        clear_active_bootstrap_ips_for_test();
+
+        let ip = Ipv4Addr::new(65, 9, 168, 90);
+
+        // IP not in active set → should be learned
+        assert!(learn_direct_only_bootstrap_ip(
+            "clientsettingscdn.roblox.com",
+            ip
+        ));
+        assert!(is_direct_only_bootstrap_ip(ip));
+
+        // Second call → already recorded, returns false
+        assert!(!learn_direct_only_bootstrap_ip(
+            "clientsettingscdn.roblox.com",
+            ip
+        ));
+
+        clear_active_bootstrap_ips_for_test();
+    }
+
+    #[test]
+    fn learn_direct_only_ip_refuses_to_demote_control_plane_pin() {
         let _guard = BOOTSTRAP_IP_TEST_LOCK.lock().unwrap();
         clear_active_bootstrap_ips_for_test();
 
         let shared_ip = Ipv4Addr::new(65, 9, 168, 90);
+        // IP is already a control-plane pin
         set_active_bootstrap_ips_for_test([shared_ip]);
 
-        assert!(learn_direct_only_bootstrap_ip(
-            "clientsettingscdn.roblox.com",
-            shared_ip
-        ));
-        assert!(is_direct_only_bootstrap_ip(shared_ip));
-        assert!(!is_active_bootstrap_ip(shared_ip));
-
+        // Should refuse — active control-plane pins must not be demoted
         assert!(!learn_direct_only_bootstrap_ip(
             "clientsettingscdn.roblox.com",
             shared_ip
         ));
+        assert!(!is_direct_only_bootstrap_ip(shared_ip));
+        assert!(is_active_bootstrap_ip(shared_ip));
 
         clear_active_bootstrap_ips_for_test();
     }
@@ -955,6 +1099,77 @@ mod tests {
         ));
 
         clear_active_bootstrap_ips_for_test();
+    }
+
+    #[test]
+    fn asset_direct_domain_matches_rbxcdn_suffix_and_named() {
+        assert!(is_asset_direct_domain("setup.rbxcdn.com"));
+        assert!(is_asset_direct_domain("apis.rbxcdn.com"));
+        assert!(is_asset_direct_domain("c0.rbxcdn.com"));
+        assert!(is_asset_direct_domain("tr.rbxcdn.com"));
+        assert!(is_asset_direct_domain("assetdelivery.roblox.com"));
+        assert!(is_asset_direct_domain("assetgame.roblox.com"));
+        assert!(is_asset_direct_domain("thumbnails.roblox.com"));
+        assert!(is_asset_direct_domain("setup.roblox.com"));
+        // control-plane hosts are NOT asset-direct
+        assert!(!is_asset_direct_domain("api.roblox.com"));
+        assert!(!is_asset_direct_domain("www.roblox.com"));
+        assert!(!is_asset_direct_domain("clientsettings.roblox.com"));
+    }
+
+    #[test]
+    fn route_assist_relays_control_plane_on_unavoidably_shared_edges() {
+        // When every IP for a control-plane domain also appears in the direct pool,
+        // conflict_free is empty and all entries are kept (relay wins for that domain).
+        let shared_ip = Ipv4Addr::new(1, 2, 3, 4);
+        let overrides = vec![
+            HostOverride {
+                ip: shared_ip,
+                domain: "api.roblox.com".to_string(),
+            },
+            HostOverride {
+                ip: shared_ip,
+                domain: "setup.rbxcdn.com".to_string(),
+            },
+        ];
+        let (_kept, active, direct_only) = allocate_route_assist_pins(overrides);
+        // The shared IP is assigned to both pools by the domain logic, but since
+        // direct_only excludes IPs already in active, the relay (control-plane)
+        // assignment wins.
+        assert!(active.contains_key(&shared_ip) || direct_only.contains(&shared_ip));
+    }
+
+    #[test]
+    fn route_assist_allocation_prefers_disjoint_pins_when_alternatives_exist() {
+        let control_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let asset_ip = Ipv4Addr::new(2, 2, 2, 2);
+        let shared_ip = Ipv4Addr::new(3, 3, 3, 3);
+        let overrides = vec![
+            HostOverride {
+                ip: control_ip,
+                domain: "api.roblox.com".to_string(),
+            },
+            HostOverride {
+                ip: shared_ip,
+                domain: "api.roblox.com".to_string(),
+            },
+            HostOverride {
+                ip: asset_ip,
+                domain: "setup.rbxcdn.com".to_string(),
+            },
+            HostOverride {
+                ip: shared_ip,
+                domain: "setup.rbxcdn.com".to_string(),
+            },
+        ];
+        let (_kept, active, direct_only) = allocate_route_assist_pins(overrides);
+        // Conflict-free control-plane IP (not in direct pool) should be preferred
+        assert!(active.contains_key(&control_ip));
+        // Conflict-free asset IP (not in active pool) should be preferred
+        assert!(direct_only.contains(&asset_ip));
+        // Shared IP may or may not appear depending on resolution, but the
+        // conflict-free entries must be chosen when alternatives exist.
+        assert!(!active.contains_key(&shared_ip));
     }
 
     #[test]

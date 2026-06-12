@@ -17,8 +17,8 @@ use tokio::sync::Mutex;
 use crate::auth::types::VpnConfig;
 use crate::callbacks::{fire_auto_routing_event, fire_error, fire_state_change};
 
-use super::auto_routing::{AutoRouter, AutoRoutingEvent};
-use super::geolocation::lookup_game_server_region;
+use super::auto_routing::{AutoRouter, AutoRoutingEvent, SAME_REGION_UPGRADE_THRESHOLD_MS};
+use super::geolocation::{lookup_game_server_region, GameServerRegionLookup};
 use super::relay::UdpRelay;
 
 const REFRESH_INTERVAL_MS: u64 = 50;
@@ -185,6 +185,37 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Compute the cached latency improvement moving to `to_region`.
+/// Returns `Some(SAME_REGION_UPGRADE_THRESHOLD_MS)` when the current relay has
+/// no cached latency (conservative: always allow the switch).
+fn compute_cached_latency_improvement(
+    router: &AutoRouter,
+    to_region: &str,
+) -> Option<u32> {
+    let servers = router.available_servers_snapshot();
+    let current_region = router.current_region();
+
+    let current_latency = servers
+        .iter()
+        .find(|(r, _, _)| *r == current_region)
+        .and_then(|(_, _, lat)| *lat);
+
+    let target_latency = servers
+        .iter()
+        .find(|(r, _, _)| {
+            r == to_region
+                || r.starts_with(&format!("{}-", to_region))
+                || to_region.starts_with(&format!("{}-", r.as_str()))
+        })
+        .and_then(|(_, _, lat)| *lat);
+
+    match (current_latency, target_latency) {
+        (Some(cur), Some(tgt)) if cur > tgt => Some(cur - tgt),
+        (None, _) => Some(SAME_REGION_UPGRADE_THRESHOLD_MS),
+        _ => Some(0),
+    }
 }
 
 async fn ping_and_select_best(
@@ -398,6 +429,7 @@ impl VpnConnection {
             Vec::new(),
             0,
             false,
+            false,
         )
         .await
     }
@@ -417,6 +449,7 @@ impl VpnConnection {
         asset_urls: Vec<String>,
         asset_relay_count: usize,
         enable_country_ban: bool,
+        enable_partial_country_ban: bool,
     ) -> Result<(), crate::error::SdkError> {
         {
             let state = self.state.lock().await;
@@ -431,15 +464,21 @@ impl VpnConnection {
         }
 
         log::info!(
-            "connect_ex: region={} apps={:?} auto_routing={} whitelisted={:?} servers={} route_assist={} excluded_urls={:?}",
+            "connect_ex: region={} apps={:?} auto_routing={} whitelisted={:?} servers={} route_assist={} country_ban={} partial_ban={} excluded_urls={:?}",
             region,
             tunnel_apps,
             auto_routing_enabled,
             whitelisted_regions,
             available_servers.len(),
             enable_api_tunneling,
+            enable_country_ban,
+            enable_partial_country_ban,
             excluded_urls
         );
+
+        if crate::diskless::system_is_diskless() {
+            log::info!("Network-booted (diskless) PC detected for this session");
+        }
 
         // Resolve user URL exclusions to IPs up-front so the classifier can
         // bypass them. Best-effort; failures just mean fewer exclusions.
@@ -455,12 +494,13 @@ impl VpnConnection {
         // those IPs become eligible for TCP tunneling. Best-effort; a failure
         // here must not block the game-traffic tunnel.
         if enable_api_tunneling && !tunnel_apps.is_empty() {
-            match crate::roblox_proxy::hosts::apply_bootstrap_overrides(enable_country_ban).await {
+            let country_ban_bypass = enable_country_ban || enable_partial_country_ban;
+            match crate::roblox_proxy::hosts::apply_bootstrap_overrides(country_ban_bypass).await {
                 Ok(()) => {
                     self.bootstrap_dns_applied = true;
                     log::info!(
                         "Route Assist: applied Roblox bootstrap DNS repair (country_ban_bypass={})",
-                        enable_country_ban
+                        country_ban_bypass
                     );
                 }
                 Err(e) => {
@@ -536,6 +576,9 @@ impl VpnConnection {
             .await;
 
         let (tunneled_processes, split_tunnel_active) = if !tunnel_apps.is_empty() {
+            // Resolve routing flags: UDP tunneling is disabled in partial-ban mode
+            // (TCP-only relay escape).
+            let udp_tunneling = !enable_partial_country_ban || enable_api_tunneling || enable_country_ban;
             match self
                 .setup_split_tunnel(
                     &config,
@@ -546,6 +589,7 @@ impl VpnConnection {
                     available_servers,
                     whitelisted_regions,
                     enable_api_tunneling,
+                    udp_tunneling,
                 )
                 .await
             {
@@ -700,9 +744,10 @@ impl VpnConnection {
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
         whitelisted_regions: Vec<String>,
         enable_api_tunneling: bool,
+        udp_tunneling: bool,
     ) -> Result<Vec<String>, crate::error::SdkError> {
-        log::info!("setup_split_tunnel: apps={:?} relay={} auto_routing={} whitelisted={:?} route_assist={}",
-            tunnel_apps, config.endpoint, auto_routing_enabled, whitelisted_regions, enable_api_tunneling);
+        log::info!("setup_split_tunnel: apps={:?} relay={} auto_routing={} whitelisted={:?} route_assist={} udp_tunneling={}",
+            tunnel_apps, config.endpoint, auto_routing_enabled, whitelisted_regions, enable_api_tunneling, udp_tunneling);
 
         if !crate::split_tunnel::SplitTunnelDriver::check_driver_available() {
             log::error!("setup_split_tunnel: WPF driver not available");
@@ -725,6 +770,7 @@ impl VpnConnection {
         // Route Assist: tell the interceptor to tunnel Roblox TCP API/bootstrap
         // traffic in addition to UDP game traffic.
         driver.set_api_tunneling_enabled(enable_api_tunneling);
+        driver.set_udp_tunneling_enabled(udp_tunneling);
 
         let relay_ctx = crate::split_tunnel::SplitTunnelDriver::relay_context_with_asset_relays(
             relay,
@@ -761,15 +807,43 @@ impl VpnConnection {
                 );
             } else {
                 let (lookup_tx, mut lookup_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<std::net::Ipv4Addr>();
+                    tokio::sync::mpsc::unbounded_channel::<(std::net::Ipv4Addr, u64, u64)>();
                 auto_router.set_lookup_channel(lookup_tx);
 
                 let router_for_lookup = Arc::clone(&auto_router);
                 let relay_for_lookup = Arc::clone(relay);
                 tokio::spawn(async move {
-                    while let Some(ip) = lookup_rx.recv().await {
-                        match lookup_game_server_region(ip).await {
-                            Some((region, location)) => {
+                    while let Some((ip, _generation, session_epoch)) = lookup_rx.recv().await {
+                        // Drop if router disabled.
+                        if !router_for_lookup.is_enabled() {
+                            router_for_lookup.clear_pending_lookup(ip);
+                            continue;
+                        }
+                        if !router_for_lookup.should_process_lookup_result(ip) {
+                            continue;
+                        }
+
+                        let lookup_result = lookup_game_server_region(ip).await;
+
+                        // Retry once on transient failure.
+                        let lookup_result = if lookup_result == GameServerRegionLookup::Failed {
+                            lookup_game_server_region(ip).await
+                        } else {
+                            lookup_result
+                        };
+
+                        // Drop if disabled or stale.
+                        if !router_for_lookup.is_enabled() {
+                            router_for_lookup.clear_pending_lookup(ip);
+                            continue;
+                        }
+                        if !router_for_lookup.lookup_commit_allowed(ip, session_epoch) {
+                            router_for_lookup.clear_pending_lookup(ip);
+                            continue;
+                        }
+
+                        match lookup_result {
+                            GameServerRegionLookup::Resolved(region, location) => {
                                 let old_region = router_for_lookup.current_region();
                                 let candidates =
                                     router_for_lookup.get_candidates_for_region(&region);
@@ -779,6 +853,18 @@ impl VpnConnection {
                                     let selected = best
                                         .map(|(r, a, _)| (r, a))
                                         .unwrap_or_else(|| candidates[0].clone());
+
+                                    // Pre-check before committing.
+                                    let latency_improvement =
+                                        compute_cached_latency_improvement(&router_for_lookup, &selected.0);
+                                    if !router_for_lookup.switch_allowed_precheck(
+                                        &selected.0,
+                                        selected.1,
+                                        latency_improvement,
+                                    ) {
+                                        router_for_lookup.clear_pending_lookup(ip);
+                                        continue;
+                                    }
 
                                     if let Some((new_addr, new_region)) = router_for_lookup
                                         .commit_switch(
@@ -808,12 +894,10 @@ impl VpnConnection {
                                         );
                                     }
                                 }
-                                router_for_lookup.clear_pending_lookup(ip);
                             }
-                            None => {
-                                router_for_lookup.clear_pending_lookup(ip);
-                            }
+                            GameServerRegionLookup::NoRegion | GameServerRegionLookup::Failed => {}
                         }
+                        router_for_lookup.clear_pending_lookup(ip);
                     }
                 });
             }

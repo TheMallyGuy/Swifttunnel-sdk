@@ -162,9 +162,23 @@ pub fn ipinfo_to_roblox_region(city: &str, country: &str) -> RobloxRegion {
     }
 }
 
+/// Result of a game server region lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GameServerRegionLookup {
+    /// Successfully resolved a known region.
+    Resolved(RobloxRegion, String),
+    /// Got a response but the region was Unknown or location was missing.
+    NoRegion,
+    /// HTTP/network error — caller may retry.
+    Failed,
+}
+
 /// Lookup runtime region for a game server IP via ipinfo.
-pub async fn lookup_game_server_region(ip: Ipv4Addr) -> Option<(RobloxRegion, String)> {
-    let _permit = get_semaphore().acquire().await.ok()?;
+pub async fn lookup_game_server_region(ip: Ipv4Addr) -> GameServerRegionLookup {
+    let _permit = match get_semaphore().acquire().await {
+        Ok(p) => p,
+        Err(_) => return GameServerRegionLookup::Failed,
+    };
 
     let cached_location = {
         let cache = get_cache();
@@ -179,15 +193,30 @@ pub async fn lookup_game_server_region(ip: Ipv4Addr) -> Option<(RobloxRegion, St
     } else {
         let url = format!("https://ipinfo.io/{}/json", ip);
         let client = geo_http_client();
-        let response = client.get(&url).send().await.ok()?;
+        let response = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("ipinfo.io request failed for {}: {}", ip, e);
+                return GameServerRegionLookup::Failed;
+            }
+        };
         if !response.status().is_success() {
             log::warn!("ipinfo.io returned status {} for {}", response.status(), ip);
-            return None;
+            return GameServerRegionLookup::Failed;
         }
-        let info: IpInfoResponse = response.json().await.ok()?;
+        let info: IpInfoResponse = match response.json().await {
+            Ok(i) => i,
+            Err(e) => {
+                log::warn!("ipinfo.io JSON parse failed for {}: {}", ip, e);
+                return GameServerRegionLookup::Failed;
+            }
+        };
         let city = info.city.clone().unwrap_or_default();
         let country = info.country.clone().unwrap_or_default();
-        let location = format_location(&info)?;
+        let location = match format_location(&info) {
+            Some(l) => l,
+            None => return GameServerRegionLookup::NoRegion,
+        };
 
         if let Ok(mut cache) = get_cache().lock() {
             cache.insert(ip, location.clone());
@@ -197,5 +226,8 @@ pub async fn lookup_game_server_region(ip: Ipv4Addr) -> Option<(RobloxRegion, St
     };
 
     let region = ipinfo_to_roblox_region(&city, &country);
-    Some((region, location))
+    if region == RobloxRegion::Unknown {
+        return GameServerRegionLookup::NoRegion;
+    }
+    GameServerRegionLookup::Resolved(region, location)
 }

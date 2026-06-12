@@ -69,6 +69,10 @@ pub struct UdpRelay {
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
+    /// Address currently being authenticated in a mid-session auth flow.
+    pending_auth_addr: ArcSwap<Option<SocketAddr>>,
+    /// Last AUTH_ACK received from any pending-auth address.
+    last_auth_ack: parking_lot::Mutex<Option<(SocketAddr, RelayAuthAckStatus)>>,
 }
 
 impl UdpRelay {
@@ -122,6 +126,8 @@ impl UdpRelay {
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
             last_activity: std::sync::Mutex::new(Instant::now()),
+            pending_auth_addr: ArcSwap::from_pointee(None),
+            last_auth_ack: parking_lot::Mutex::new(None),
         })
     }
 
@@ -174,6 +180,23 @@ impl UdpRelay {
         let mut recv_buf = [0u8; 1600];
         match self.socket.recv_from(&mut recv_buf) {
             Ok((len, from)) => {
+                // Mid-session auth: if we're authenticating a target address and
+                // this packet arrives from it, check if it's an AUTH_ACK and
+                // record it. Drop from normal processing either way.
+                if let Some(pending) = **self.pending_auth_addr.load() {
+                    if from == pending {
+                        if len >= SESSION_ID_LEN + 2
+                            && recv_buf[..SESSION_ID_LEN] == self.session_id
+                            && recv_buf[SESSION_ID_LEN] == AUTH_ACK_FRAME_TYPE
+                        {
+                            let status = RelayAuthAckStatus::from_u8(recv_buf[SESSION_ID_LEN + 1])
+                                .unwrap_or(RelayAuthAckStatus::BadFormat);
+                            *self.last_auth_ack.lock() = Some((from, status));
+                        }
+                        return Ok(None);
+                    }
+                }
+
                 let expected_addr = **self.relay_addr.load();
                 if from != expected_addr {
                     let in_grace = if let (Some(prev), Some(switched_at)) = (
@@ -296,8 +319,13 @@ impl UdpRelay {
         format!("{:016x}", self.session_id_u64())
     }
 
-    /// Send a relay auth-hello frame: [session_id:8][0xA1][token_len:2][token_utf8].
-    fn send_auth_hello(&self, token: &str) -> Result<(), crate::error::SdkError> {
+    /// Send a relay auth-hello frame to an explicit target address.
+    /// Frame: [session_id:8][0xA1][token_len:2][token_utf8].
+    fn send_auth_hello_to(
+        &self,
+        token: &str,
+        target: SocketAddr,
+    ) -> Result<(), crate::error::SdkError> {
         let token_bytes = token.as_bytes();
         if token_bytes.is_empty() || token_bytes.len() > u16::MAX as usize {
             return Err(crate::error::SdkError::Vpn(format!(
@@ -312,17 +340,22 @@ impl UdpRelay {
         frame.extend_from_slice(&(token_bytes.len() as u16).to_be_bytes());
         frame.extend_from_slice(token_bytes);
 
-        let current_addr = **self.relay_addr.load();
-        self.socket.send_to(&frame, current_addr).map_err(|e| {
+        self.socket.send_to(&frame, target).map_err(|e| {
             crate::error::SdkError::Vpn(format!("Failed to send relay auth hello: {}", e))
         })?;
         log::debug!(
             "UDP Relay: Sent auth hello to {} (session {:016x}, token {} bytes)",
-            current_addr,
+            target,
             self.session_id_u64(),
             token_bytes.len()
         );
         Ok(())
+    }
+
+    /// Send a relay auth-hello frame to the current relay address.
+    fn send_auth_hello(&self, token: &str) -> Result<(), crate::error::SdkError> {
+        let current_addr = **self.relay_addr.load();
+        self.send_auth_hello_to(token, current_addr)
     }
 
     fn wait_for_auth_ack(
@@ -357,6 +390,74 @@ impl UdpRelay {
                 Err(e) => return Err(crate::error::SdkError::Vpn(e.to_string())),
             }
         }
+        Ok(None)
+    }
+
+    /// Authenticate a new relay address mid-session (for auto-routing switch).
+    ///
+    /// Sets `pending_auth_addr` so `receive_inbound` intercepts the ack from
+    /// `target`, then runs a retry loop, polling `last_auth_ack`.
+    /// Clears `pending_auth_addr` on exit (success or timeout).
+    pub async fn authenticate_addr_with_ticket(
+        &self,
+        token: &str,
+        target: SocketAddr,
+    ) -> Result<Option<RelayAuthAckStatus>, crate::error::SdkError> {
+        // Signal the inbound receiver to watch for acks from this address.
+        self.pending_auth_addr.store(Arc::new(Some(target)));
+        *self.last_auth_ack.lock() = None;
+
+        let result = self.authenticate_addr_inner(token, target).await;
+
+        // Always clear the pending address.
+        self.pending_auth_addr.store(Arc::new(None));
+        result
+    }
+
+    /// Inner retry loop for `authenticate_addr_with_ticket`.
+    async fn authenticate_addr_inner(
+        &self,
+        token: &str,
+        target: SocketAddr,
+    ) -> Result<Option<RelayAuthAckStatus>, crate::error::SdkError> {
+        let deadline =
+            tokio::time::Instant::now() + AUTH_HANDSHAKE_TOTAL_TIMEOUT;
+
+        for attempt in 0..AUTH_HANDSHAKE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(AUTH_HANDSHAKE_RETRY_DELAY).await;
+            }
+
+            if let Err(e) = self.send_auth_hello_to(token, target) {
+                log::warn!("authenticate_addr_inner: send failed: {}", e);
+                continue;
+            }
+
+            // Poll for the ack (set by receive_inbound from the interceptor thread).
+            let poll_deadline = tokio::time::Instant::now() + AUTH_HANDSHAKE_RETRY_DELAY;
+            while tokio::time::Instant::now() < poll_deadline {
+                {
+                    let guard = self.last_auth_ack.lock();
+                    if let Some((from, status)) = *guard {
+                        if from == target {
+                            log::info!(
+                                "UDP Relay: Mid-session auth ack {} for {} (session {:016x})",
+                                status.as_str(),
+                                target,
+                                self.session_id_u64()
+                            );
+                            return Ok(Some(status));
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+
         Ok(None)
     }
 

@@ -7,8 +7,10 @@
 mod asset_route;
 mod auth;
 mod callbacks;
+pub mod diskless;
 mod error;
 mod exclusions;
+pub mod process_names;
 mod roblox_proxy;
 mod runtime;
 mod split_tunnel;
@@ -70,6 +72,10 @@ struct ConnectExOptions {
     /// Implicitly enables `enable_api_tunneling`.
     #[serde(default)]
     enable_country_ban: bool,
+    /// Partial country-ban bypass: tunnel TCP API/bootstrap traffic but not UDP
+    /// game traffic. Implicitly enables `enable_api_tunneling`.
+    #[serde(default)]
+    enable_partial_country_ban: bool,
     /// URLs/hosts to never tunnel. Each is resolved to IPs at connect time and
     /// any traffic to those IPs always bypasses the relay.
     #[serde(default)]
@@ -172,12 +178,13 @@ fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 
         options.auto_routing.enabled,
         available_servers,
         options.auto_routing.whitelisted_regions,
-        options.enable_api_tunneling || options.enable_country_ban,
+        options.enable_api_tunneling || options.enable_country_ban || options.enable_partial_country_ban,
         options.excluded_urls,
         options.asset_relay_server,
         options.asset_urls,
         options.asset_relay_count,
         options.enable_country_ban,
+        options.enable_partial_country_ban,
     )) {
         Ok(()) => SUCCESS,
         Err(e) => {
@@ -628,6 +635,7 @@ pub unsafe extern "C" fn swifttunnel_connect(
         asset_urls: Vec::new(),
         asset_relay_count: 0,
         enable_country_ban: false,
+        enable_partial_country_ban: false,
     };
 
     let mut guard = SDK.lock();

@@ -124,6 +124,12 @@ impl SplitTunnelDriver {
         self.interceptor.set_api_tunneling_enabled(enabled);
     }
 
+    /// Enable/disable UDP tunneling. When disabled, UDP packets always bypass
+    /// the relay. Used with partial-country-ban mode where only TCP needs bypass.
+    pub fn set_udp_tunneling_enabled(&self, enabled: bool) {
+        self.interceptor.set_udp_tunneling_enabled(enabled);
+    }
+
     /// Switch relay destination without restarting split tunnel.
     pub fn switch_relay_addr(&self, new_addr: std::net::SocketAddr) -> bool {
         self.interceptor.switch_relay_addr(new_addr)

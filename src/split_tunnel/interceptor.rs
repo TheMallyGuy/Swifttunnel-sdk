@@ -248,6 +248,9 @@ pub struct ParallelInterceptor {
     auto_router: Option<Arc<crate::vpn::auto_routing::AutoRouter>>,
     /// Route Assist: tunnel Roblox TCP API/bootstrap traffic too (not just UDP).
     api_tunneling_enabled: Arc<AtomicBool>,
+    /// When false, UDP packets (protocol 17) are never tunneled. Used with
+    /// country-ban mode when route assist is active but UDP relay is not needed.
+    udp_tunneling_enabled: Arc<AtomicBool>,
 }
 
 impl ParallelInterceptor {
@@ -290,6 +293,7 @@ impl ParallelInterceptor {
             refresh_now_flag: Arc::new(AtomicBool::new(false)),
             auto_router: None,
             api_tunneling_enabled: Arc::new(AtomicBool::new(false)),
+            udp_tunneling_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -298,6 +302,14 @@ impl ParallelInterceptor {
     pub fn set_api_tunneling_enabled(&self, enabled: bool) {
         self.api_tunneling_enabled.store(enabled, Ordering::Relaxed);
         log::info!("Route Assist (TCP API tunneling) set to {}", enabled);
+    }
+
+    /// Enable or disable UDP tunneling. When disabled, UDP packets (protocol 17)
+    /// always bypass the relay. Used when country-ban is active without UDP
+    /// relay assist.
+    pub fn set_udp_tunneling_enabled(&self, enabled: bool) {
+        self.udp_tunneling_enabled.store(enabled, Ordering::Relaxed);
+        log::info!("UDP tunneling set to {}", enabled);
     }
 
     /// Trigger immediate cache refresh (call when ETW detects game process)
@@ -838,6 +850,21 @@ impl ParallelInterceptor {
         self.disable_adapter_offload()?;
         self.disable_ipv6()?;
 
+        #[cfg(target_os = "windows")]
+        if crate::diskless::system_is_diskless() {
+            if let Some(physical_name) = self.physical_adapter_name.clone() {
+                match crate::vpn::diskless_passthrough::install_for_adapter(&physical_name) {
+                    Ok(0) => log::info!("Diskless PC detected but no System disk flows found to protect"),
+                    Ok(count) => log::info!(
+                        "Diskless PC: {count} kernel pass filter(s) protect the system disk from interception"
+                    ),
+                    Err(e) => log::warn!(
+                        "Diskless PC: could not install disk-traffic pass filters (continuing): {e}"
+                    ),
+                }
+            }
+        }
+
         self.stop_flag.store(false, Ordering::SeqCst);
         self.active = true;
 
@@ -864,6 +891,7 @@ impl ParallelInterceptor {
             let relay_ctx = self.relay_ctx.clone();
             let auto_router = self.auto_router.clone();
             let api_tunneling_enabled = Arc::clone(&self.api_tunneling_enabled);
+            let udp_tunneling_enabled = Arc::clone(&self.udp_tunneling_enabled);
 
             let handle = thread::spawn(move || {
                 set_thread_affinity(worker_id);
@@ -877,6 +905,7 @@ impl ParallelInterceptor {
                     relay_ctx,
                     auto_router,
                     api_tunneling_enabled,
+                    udp_tunneling_enabled,
                 );
             });
 
@@ -986,6 +1015,9 @@ impl ParallelInterceptor {
 
         self.enable_adapter_offload();
         self.enable_ipv6();
+
+        #[cfg(target_os = "windows")]
+        crate::vpn::diskless_passthrough::remove_installed();
     }
 
     /// Check if active
@@ -1186,6 +1218,7 @@ fn run_packet_worker(
     relay_ctx: Option<Arc<RelayForwardContext>>,
     auto_router: Option<Arc<crate::vpn::auto_routing::AutoRouter>>,
     api_tunneling_enabled: Arc<AtomicBool>,
+    udp_tunneling_enabled: Arc<AtomicBool>,
 ) {
     log::info!("Worker {} started", worker_id);
 
@@ -1252,12 +1285,14 @@ fn run_packet_worker(
 
         if work.is_outbound {
             let api_tunneling = api_tunneling_enabled.load(Ordering::Relaxed);
+            let udp_tunneling = udp_tunneling_enabled.load(Ordering::Relaxed);
             let relay_addr = relay_ctx.as_ref().map(|r| r.relay.relay_addr());
             let should_tunnel = should_route_to_relay(
                 &work.data,
                 &snapshot,
                 &mut inline_cache,
                 api_tunneling,
+                udp_tunneling,
                 relay_addr,
             );
             let auto_routing_bypass =
@@ -1752,9 +1787,10 @@ fn should_route_to_relay(
     snapshot: &ProcessSnapshot,
     inline_cache: &mut HashMap<(Ipv4Addr, u16, Protocol), bool>,
     api_tunneling: bool,
+    udp_tunneling: bool,
     relay_addr: Option<std::net::SocketAddr>,
 ) -> bool {
-    let decision = classify_packet(data, snapshot, inline_cache, api_tunneling);
+    let decision = classify_packet(data, snapshot, inline_cache, api_tunneling, udp_tunneling);
     log_destination(data, snapshot, decision, relay_addr);
 
     // SNI learning: if we are relaying a TCP:443 flow and the packet carries a
@@ -1889,6 +1925,7 @@ fn classify_packet(
     snapshot: &ProcessSnapshot,
     inline_cache: &mut HashMap<(Ipv4Addr, u16, Protocol), bool>,
     api_tunneling: bool,
+    udp_tunneling: bool,
 ) -> bool {
     if data.len() < 14 + 20 + 4 {
         return false;
@@ -1907,6 +1944,10 @@ fn classify_packet(
 
     let ihl = ((data[ip_start] & 0xF) as usize) * 4;
     let protocol_num = data[ip_start + 9];
+    // When UDP tunneling is disabled, never tunnel protocol 17 packets.
+    if protocol_num == 17 && !udp_tunneling {
+        return false;
+    }
     let protocol = match protocol_num {
         6 => Protocol::Tcp,
         17 => Protocol::Udp,
@@ -1937,6 +1978,15 @@ fn classify_packet(
     // Phase 0: user URL exclusions. Traffic to an excluded host is never
     // tunneled — bypass it regardless of process/destination rules.
     if crate::exclusions::is_excluded_ip(dst_ip) {
+        return false;
+    }
+
+    // Phase 0b: direct-only bootstrap IPs (e.g. clientsettings*, asset CDN).
+    // These must never be tunneled even for known tunnel apps — they are pinned
+    // to go direct so launch-critical settings fetches don't ride a flaky relay.
+    let dst_is_direct_tcp = protocol == Protocol::Tcp
+        && crate::roblox_proxy::hosts::is_direct_only_bootstrap_ip(dst_ip);
+    if dst_is_direct_tcp {
         return false;
     }
 

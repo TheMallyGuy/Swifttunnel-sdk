@@ -58,6 +58,54 @@ pub async fn measure_latency(endpoint: &str) -> Option<u32> {
     }
 }
 
+/// Measure latency to a server using ICMP ping via the Windows IcmpSendEcho API.
+/// Locale-safe: does not parse ping.exe text output.
+#[cfg(windows)]
+pub fn measure_latency_icmp(ip: &str) -> Option<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    };
+    const IP_STATUS_SUCCESS: u32 = 0;
+    const ICMP_TIMEOUT_MS: u32 = 2000;
+    const PAYLOAD_LEN: usize = 32;
+    let target: std::net::Ipv4Addr = ip.parse().ok()?;
+    let dest = u32::from_ne_bytes(target.octets());
+    let handle = unsafe { IcmpCreateFile() }.ok()?;
+    let payload = [0u8; PAYLOAD_LEN];
+    let mut reply_buf = vec![0u8; std::mem::size_of::<ICMP_ECHO_REPLY>() + PAYLOAD_LEN + 8];
+    let reply_count = unsafe {
+        IcmpSendEcho(
+            handle,
+            dest,
+            payload.as_ptr() as *const core::ffi::c_void,
+            payload.len() as u16,
+            None,
+            reply_buf.as_mut_ptr() as *mut core::ffi::c_void,
+            reply_buf.len() as u32,
+            ICMP_TIMEOUT_MS,
+        )
+    };
+    let latency = if reply_count > 0 {
+        let reply = unsafe { &*(reply_buf.as_ptr() as *const ICMP_ECHO_REPLY) };
+        if reply.Status == IP_STATUS_SUCCESS {
+            Some(reply.RoundTripTime)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    unsafe {
+        let _ = IcmpCloseHandle(handle);
+    }
+    latency
+}
+
+#[cfg(not(windows))]
+pub fn measure_latency_icmp(_ip: &str) -> Option<u32> {
+    None
+}
+
 /// Dynamic server info (from API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicServerInfo {

@@ -13,7 +13,9 @@
 pub mod auto_routing;
 pub mod config;
 pub mod connection;
+pub mod diskless_passthrough;
 pub mod geolocation;
+pub mod ipv6_recovery;
 pub mod relay;
 pub mod servers;
 
