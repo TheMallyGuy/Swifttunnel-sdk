@@ -509,24 +509,34 @@ impl VpnConnection {
             }
         }
 
+        // Studio exclusion: keep Studio direct unless country ban requires relaying
+        // it to reach Roblox at all. Studio breaks Team Create through the relay
+        // (its place-sync TCP exceeds the relay forward buffer).
+        let mut tunnel_apps = tunnel_apps;
+        if !(enable_country_ban || enable_partial_country_ban) {
+            tunnel_apps.retain(|app| !crate::process_names::is_roblox_studio_process_name(app));
+        }
+
         // Bypass Country Bans: launch GoodbyeDPI so DPI/SNI-based blocks on
-        // Roblox traffic are bypassed at the ISP level. Best-effort: a missing
-        // executable is a warning, not an error, so users without GoodbyeDPI
-        // still get the relay bypass.
+        // Roblox traffic are bypassed at the ISP level. GoodbyeDPI is now
+        // best-effort: the relay is the primary bypass, so a failure or timeout
+        // here is logged but does NOT surface as a user-facing error.
         if enable_country_ban {
-            match crate::roblox_proxy::goodbyedpi::start_for_roblox() {
+            match crate::roblox_proxy::goodbyedpi::start_for_roblox().await {
                 Ok(Some(guard)) => {
                     log::info!("GoodbyeDPI helper started for country ban bypass");
                     self.goodbye_dpi_guard = Some(guard);
                 }
                 Ok(None) => {
-                    log::warn!(
-                        "GoodbyeDPI helper not available; country ban bypass will rely on relay only"
+                    log::info!(
+                        "V3: GoodbyeDPI helper unavailable; relying on the relay for country-ban bypass"
                     );
                 }
                 Err(e) => {
-                    log::warn!("GoodbyeDPI helper failed: {}; continuing without DPI bypass", e);
-                    self.country_ban_bypass_failure = Some(e);
+                    log::warn!(
+                        "V3: GoodbyeDPI could not confirm a working mode; relying on the relay for country-ban bypass: {}",
+                        e
+                    );
                 }
             }
         }

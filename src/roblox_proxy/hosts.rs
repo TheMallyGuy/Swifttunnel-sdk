@@ -180,6 +180,21 @@ struct DohJsonAnswer {
 /// (the default, which avoids flaky-relay "Failed to apply critical settings")
 /// sends them straight into the block and the game won't launch.
 pub async fn apply_bootstrap_overrides(country_ban_bypass: bool) -> Result<(), String> {
+    // Full bypass relays every Roblox host. Lock that routing decision in BEFORE
+    // the fallible DoH resolution below. Under a full block the censor commonly
+    // blocks public DoH too, so resolution can fail — and if it does, we must
+    // still be in country-ban routing. Otherwise the country-ban flag stays
+    // unset, runtime SNI-learning treats the session like Route Assist, and it
+    // demotes clientsettings/asset hosts onto the (censored) direct path
+    // mid-session: they relay once, then get RST'd — the "plays 20s then dies"
+    // report. Setting the flag up front (and clearing any stale direct-only pins
+    // a prior Route Assist/partial session left behind) keeps those hosts on the
+    // relay even when we get zero pins; recognized Roblox/strapper flows relay on
+    // process identity alone, so the pins are an optimization, not a prerequisite.
+    if country_ban_bypass {
+        enter_country_ban_routing();
+    }
+
     let resolved = resolve_bootstrap_overrides().await?;
     let (overrides, active_ips, direct_only_ips) = if country_ban_bypass {
         let (active, direct_only) = country_ban_split_ips_from_overrides(&resolved);
@@ -198,6 +213,16 @@ pub async fn apply_bootstrap_overrides(country_ban_bypass: bool) -> Result<(), S
 }
 
 /// Whether `ip` is one of the currently-applied Route Assist bootstrap IPs.
+/// Enter full country-ban routing: mark the session as relaying every Roblox
+/// host and drop any stale direct-only pins from a prior Route Assist/partial
+/// session. Idempotent. Kept separate from [`apply_bootstrap_overrides`] so this
+/// routing decision survives a DoH-resolution failure (which returns early) and
+/// is unit-testable without touching the network.
+fn enter_country_ban_routing() {
+    COUNTRY_BAN_BYPASS_ROUTING.store(true, Ordering::Relaxed);
+    set_direct_only_bootstrap_ips(HashSet::new());
+}
+
 pub fn is_active_bootstrap_ip(ip: Ipv4Addr) -> bool {
     active_bootstrap_ips()
         .read()
