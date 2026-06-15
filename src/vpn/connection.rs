@@ -618,6 +618,33 @@ impl VpnConnection {
             (Vec::new(), false)
         };
 
+        // Full bypass + a real DNS block (Egypt): local DoH is dead and system
+        // DNS is poisoned, so the pins above may be wrong. Now that the relay
+        // tunnel is up, resolve Roblox's real IPs *through* the relay (which
+        // sits outside the censorship) and merge them into the hosts-file pins.
+        // Best-effort: an older relay without resolve support returns nothing.
+        if enable_country_ban {
+            let resolved = relay
+                .resolve_roblox_hosts(
+                    crate::roblox_proxy::hosts::ROBLOX_BOOTSTRAP_DOMAINS,
+                    std::time::Duration::from_secs(3),
+                )
+                .await;
+            if resolved.is_empty() {
+                log::info!(
+                    "Relay-resolved DNS returned nothing (relay without resolve support, or hosts unresolved)"
+                );
+            } else {
+                let count = resolved.len();
+                match crate::roblox_proxy::hosts::apply_relay_resolved_overrides(resolved).await {
+                    Ok(()) => log::info!(
+                        "Applied relay-resolved pins for {count} Roblox host(s) (DNS via relay)"
+                    ),
+                    Err(e) => log::warn!("Relay-resolved Roblox pins could not be applied: {e}"),
+                }
+            }
+        }
+
         self.set_state(ConnectionState::Connected {
             since: Instant::now(),
             server_region: config.region.clone(),

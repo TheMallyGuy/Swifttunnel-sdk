@@ -57,6 +57,13 @@ static ACTIVE_BOOTSTRAP_IPS: OnceLock<RwLock<HashMap<Ipv4Addr, String>>> = OnceL
 /// IPs that have DNS repaired but must NOT be relayed — going direct is safer
 /// for launch-critical bootstrap requests.
 static DIRECT_ONLY_BOOTSTRAP_IPS: OnceLock<RwLock<HashSet<Ipv4Addr>>> = OnceLock::new();
+/// The host overrides currently written to the hosts file, so a later
+/// relay-resolved DNS pass can merge into them instead of clobbering them.
+static LAST_APPLIED_OVERRIDES: OnceLock<RwLock<Vec<HostOverride>>> = OnceLock::new();
+
+fn last_applied_overrides() -> &'static RwLock<Vec<HostOverride>> {
+    LAST_APPLIED_OVERRIDES.get_or_init(|| RwLock::new(Vec::new()))
+}
 
 /// True while the current session deliberately relays the launch-critical
 /// settings hosts (country-ban bypass). Runtime SNI learning must not undo
@@ -203,6 +210,9 @@ pub async fn apply_bootstrap_overrides(country_ban_bypass: bool) -> Result<(), S
         allocate_route_assist_pins(resolved)
     };
 
+    if let Ok(mut last) = last_applied_overrides().write() {
+        *last = overrides.clone();
+    }
     tokio::task::spawn_blocking(move || write_overrides(&overrides))
         .await
         .map_err(|e| e.to_string())??;
@@ -212,7 +222,58 @@ pub async fn apply_bootstrap_overrides(country_ban_bypass: bool) -> Result<(), S
     Ok(())
 }
 
-/// Whether `ip` is one of the currently-applied Route Assist bootstrap IPs.
+/// Merge relay-resolved Roblox IPs into the hosts-file pins and the active
+/// (relayed) IP set. The relay resolves Roblox's real IPs from outside the
+/// censorship, so this is the fallback for full country-ban when local DoH is
+/// blocked/poisoned: without it the player connects to poisoned addresses the
+/// relay can't reach ("problem reaching our servers"). Every merged IP becomes
+/// an active pin — full bypass relays every Roblox host.
+pub async fn apply_relay_resolved_overrides(
+    resolved: std::collections::HashMap<String, Vec<Ipv4Addr>>,
+) -> Result<(), String> {
+    let mut new_entries: Vec<HostOverride> = Vec::new();
+    for (domain, ips) in resolved {
+        for ip in ips.into_iter().take(MAX_PINNED_IPS_PER_DOMAIN) {
+            new_entries.push(HostOverride {
+                ip,
+                domain: domain.clone(),
+            });
+        }
+    }
+    if new_entries.is_empty() {
+        return Ok(());
+    }
+
+    // Merge with the pins already written (DoH results), de-duping by (domain, ip).
+    let existing = last_applied_overrides()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let mut seen: HashSet<(String, Ipv4Addr)> = HashSet::new();
+    let mut merged: Vec<HostOverride> = Vec::with_capacity(existing.len() + new_entries.len());
+    for entry in existing.into_iter().chain(new_entries.into_iter()) {
+        if seen.insert((entry.domain.to_ascii_lowercase(), entry.ip)) {
+            merged.push(entry);
+        }
+    }
+
+    let merged_for_write = merged.clone();
+    tokio::task::spawn_blocking(move || write_overrides(&merged_for_write))
+        .await
+        .map_err(|e| format!("Failed to join relay-resolved hosts write: {e}"))??;
+
+    if let Ok(mut last) = last_applied_overrides().write() {
+        *last = merged.clone();
+    }
+    // SDK-specific: active map is HashMap<ip, domain>; extend with new entries.
+    if let Ok(mut active) = active_bootstrap_ips().write() {
+        for entry in &merged {
+            active.entry(entry.ip).or_insert_with(|| entry.domain.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Enter full country-ban routing: mark the session as relaying every Roblox
 /// host and drop any stale direct-only pins from a prior Route Assist/partial
 /// session. Idempotent. Kept separate from [`apply_bootstrap_overrides`] so this
@@ -223,6 +284,7 @@ fn enter_country_ban_routing() {
     set_direct_only_bootstrap_ips(HashSet::new());
 }
 
+/// Whether `ip` is one of the currently-applied Route Assist bootstrap IPs.
 pub fn is_active_bootstrap_ip(ip: Ipv4Addr) -> bool {
     active_bootstrap_ips()
         .read()

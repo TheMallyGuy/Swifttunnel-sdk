@@ -15,6 +15,14 @@ const RELAY_SWITCH_GRACE_PERIOD: Duration = Duration::from_secs(2);
 // Relay control-frame types (must match the relay server protocol).
 const AUTH_HELLO_FRAME_TYPE: u8 = 0xA1;
 const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
+// Censorship-resistant Roblox DNS resolve (see swifttunnel-relay). The client
+// asks the relay (outside the censorship) for Roblox's real IPs when local
+// DNS is blocked/poisoned. Optional + backward-compatible: old relays never
+// reply 0xA7, so the caller just falls back to its DoH pins.
+const RESOLVE_REQUEST_FRAME_TYPE: u8 = 0xA6;
+const RESOLVE_RESPONSE_FRAME_TYPE: u8 = 0xA7;
+const RESOLVE_MAX_HOSTS_PER_REQUEST: usize = 16;
+const RESOLVE_MAX_HOSTNAME_LEN: usize = 64;
 
 const AUTH_HANDSHAKE_TOTAL_TIMEOUT: Duration = Duration::from_millis(1500);
 const AUTH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -73,6 +81,10 @@ pub struct UdpRelay {
     pending_auth_addr: ArcSwap<Option<SocketAddr>>,
     /// Last AUTH_ACK received from any pending-auth address.
     last_auth_ack: parking_lot::Mutex<Option<(SocketAddr, RelayAuthAckStatus)>>,
+    /// Latest Roblox DNS resolve response (request_id + host→IPs) recorded by
+    /// receive_inbound; polled by `resolve_roblox_hosts` during connect.
+    last_resolve_response:
+        parking_lot::Mutex<Option<(u16, Vec<(String, Vec<std::net::Ipv4Addr>)>)>>,
 }
 
 impl UdpRelay {
@@ -128,6 +140,7 @@ impl UdpRelay {
             last_activity: std::sync::Mutex::new(Instant::now()),
             pending_auth_addr: ArcSwap::from_pointee(None),
             last_auth_ack: parking_lot::Mutex::new(None),
+            last_resolve_response: parking_lot::Mutex::new(None),
         })
     }
 
@@ -219,6 +232,16 @@ impl UdpRelay {
                     return Ok(None);
                 }
 
+                // Intercept resolve response frames before they reach the caller.
+                if len > SESSION_ID_LEN
+                    && recv_buf[SESSION_ID_LEN] == RESOLVE_RESPONSE_FRAME_TYPE
+                {
+                    if let Some(parsed) = parse_resolve_response(&recv_buf, len) {
+                        *self.last_resolve_response.lock() = Some(parsed);
+                    }
+                    return Ok(None);
+                }
+
                 let payload_len = len - SESSION_ID_LEN;
                 if payload_len > buffer.len() {
                     return Ok(None);
@@ -280,6 +303,71 @@ impl UdpRelay {
             self.send_keepalive_now()?;
         }
         Ok(())
+    }
+
+    /// Send a Roblox DNS resolve request (0xA6). Best-effort: returns false if
+    /// the socket send fails. The reply is stored by `receive_inbound`.
+    fn send_resolve_request(&self, request_id: u16, hosts: &[&str]) -> bool {
+        let current_addr = **self.relay_addr.load();
+        let count = hosts.len().min(RESOLVE_MAX_HOSTS_PER_REQUEST);
+        let mut frame = Vec::with_capacity(SESSION_ID_LEN + 4 + count * 24);
+        frame.extend_from_slice(&self.session_id);
+        frame.push(RESOLVE_REQUEST_FRAME_TYPE);
+        frame.extend_from_slice(&request_id.to_be_bytes());
+        frame.push(count as u8);
+        for host in hosts.iter().take(count) {
+            let hb = host.as_bytes();
+            let hlen = hb.len().min(RESOLVE_MAX_HOSTNAME_LEN);
+            frame.push(hlen as u8);
+            frame.extend_from_slice(&hb[..hlen]);
+        }
+        self.socket.send_to(&frame, current_addr).is_ok()
+    }
+
+    /// Resolve Roblox hostnames through the relay (censorship-resistant lookup
+    /// from outside the censor) when local DNS is blocked/poisoned. Sends in
+    /// batches and collects whatever resolves within `per_batch_timeout`.
+    /// Best-effort: an old relay that doesn't support the resolve frame simply
+    /// returns nothing, and the caller keeps its DoH pins.
+    pub async fn resolve_roblox_hosts(
+        &self,
+        hosts: &[&str],
+        per_batch_timeout: std::time::Duration,
+    ) -> std::collections::HashMap<String, Vec<std::net::Ipv4Addr>> {
+        let mut out: std::collections::HashMap<String, Vec<std::net::Ipv4Addr>> =
+            std::collections::HashMap::new();
+        let mut request_id: u16 = 1;
+        for chunk in hosts.chunks(RESOLVE_MAX_HOSTS_PER_REQUEST) {
+            *self.last_resolve_response.lock() = None;
+            if !self.send_resolve_request(request_id, chunk) {
+                request_id = request_id.wrapping_add(1);
+                continue;
+            }
+            let deadline = Instant::now() + per_batch_timeout;
+            loop {
+                let matched = {
+                    let guard = self.last_resolve_response.lock();
+                    match guard.as_ref() {
+                        Some((rid, answers)) if *rid == request_id => Some(answers.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(answers) = matched {
+                    for (host, ips) in answers {
+                        if !ips.is_empty() {
+                            out.entry(host).or_default().extend(ips);
+                        }
+                    }
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            request_id = request_id.wrapping_add(1);
+        }
+        out
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -501,6 +589,58 @@ impl Drop for UdpRelay {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Parse a 0xA7 resolve response body: `[session_id][0xA7][request_id_be_u16]
+/// [answer_count:1][(host_len:1, host_utf8, ip_count:1, (ipv4_be:4)*)]*`.
+/// Returns the request id and the resolved host→IPv4 answers.
+/// `None` on a malformed frame.
+fn parse_resolve_response(
+    frame: &[u8],
+    len: usize,
+) -> Option<(u16, Vec<(String, Vec<std::net::Ipv4Addr>)>)> {
+    let header = SESSION_ID_LEN + 1; // session id + frame type byte
+    if len < header + 3 {
+        return None;
+    }
+    let request_id = u16::from_be_bytes([frame[header], frame[header + 1]]);
+    let answer_count = frame[header + 2] as usize;
+    let mut answers = Vec::with_capacity(answer_count);
+    let mut off = header + 3;
+    for _ in 0..answer_count {
+        if off >= len {
+            return None;
+        }
+        let hlen = frame[off] as usize;
+        off += 1;
+        if off + hlen > len {
+            return None;
+        }
+        let host = std::str::from_utf8(&frame[off..off + hlen])
+            .ok()?
+            .to_string();
+        off += hlen;
+        if off >= len {
+            return None;
+        }
+        let ip_count = frame[off] as usize;
+        off += 1;
+        if off + ip_count * 4 > len {
+            return None;
+        }
+        let mut ips = Vec::with_capacity(ip_count);
+        for _ in 0..ip_count {
+            ips.push(std::net::Ipv4Addr::new(
+                frame[off],
+                frame[off + 1],
+                frame[off + 2],
+                frame[off + 3],
+            ));
+            off += 4;
+        }
+        answers.push((host, ips));
+    }
+    Some((request_id, answers))
 }
 
 fn getrandom(buf: &mut [u8]) {
