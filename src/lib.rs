@@ -960,6 +960,29 @@ pub extern "C" fn swifttunnel_refresh_processes() -> i32 {
     SUCCESS
 }
 
+/// Run startup preparation before connecting: clears any leftover WinpkFilter
+/// adapter bindings from a prior crash and checks that the split-tunnel driver
+/// is available. Returns 1 if the driver is ready, 0 if unavailable.
+#[no_mangle]
+pub extern "C" fn swifttunnel_startup_prepare() -> i32 {
+    clear_error();
+
+    #[cfg(windows)]
+    {
+        match crate::split_tunnel::SplitTunnelDriver::disable_leftover_winpkfilter_bindings() {
+            Ok(_) => {}
+            Err(e) => log::warn!("Startup prepare: WinpkFilter binding cleanup failed: {e}"),
+        }
+    }
+
+    if crate::split_tunnel::SplitTunnelDriver::check_driver_available() {
+        1
+    } else {
+        set_error("Split tunnel driver is not available".to_string());
+        0
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Callbacks (4)
 // ═══════════════════════════════════════════════════════════════════════════
