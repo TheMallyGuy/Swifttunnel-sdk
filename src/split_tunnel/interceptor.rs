@@ -676,6 +676,8 @@ impl ParallelInterceptor {
     #[cfg(windows)]
     fn parse_adapter_guid(internal_name: &str) -> Option<windows::core::GUID> {
         let s = internal_name.rsplit('\\').next().unwrap_or(internal_name);
+        // GUID::try_from requires exactly 36 chars (no braces); strip them.
+        let s = s.trim_matches(|c| c == '{' || c == '}');
         windows::core::GUID::try_from(s).ok()
     }
 
