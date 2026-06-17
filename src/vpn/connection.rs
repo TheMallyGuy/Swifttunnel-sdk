@@ -586,9 +586,10 @@ impl VpnConnection {
             .await;
 
         let (tunneled_processes, split_tunnel_active) = if !tunnel_apps.is_empty() {
-            // Resolve routing flags: UDP tunneling is disabled in partial-ban mode
-            // (TCP-only relay escape).
-            let udp_tunneling = !enable_partial_country_ban || enable_api_tunneling || enable_country_ban;
+            // Partial bypass wins: stacking Route Assist UDP relay with partial-ban
+            // has caused temporary joins followed by Roblox server/menu failures.
+            let effective_route_assist = enable_api_tunneling && !enable_partial_country_ban;
+            let udp_tunneling = effective_route_assist || enable_country_ban;
             match self
                 .setup_split_tunnel(
                     &config,
@@ -1024,6 +1025,16 @@ impl VpnConnection {
             guard.close();
         }
         self.split_tunnel = None;
+
+        #[cfg(windows)]
+        match crate::split_tunnel::SplitTunnelDriver::disable_leftover_winpkfilter_bindings() {
+            Ok(disabled) if !disabled.is_empty() => log::info!(
+                "Disconnect cleanup: disabled WinpkFilter binding on adapter(s): {}",
+                disabled.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => log::warn!("Disconnect cleanup: WinpkFilter binding cleanup failed: {e}"),
+        }
 
         // Drop any user URL exclusions.
         crate::exclusions::clear();

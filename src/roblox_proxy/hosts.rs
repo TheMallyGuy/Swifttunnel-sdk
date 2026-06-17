@@ -42,7 +42,11 @@ const DNS_REPAIR_RESOLVERS: &[&str] = &[
 /// resolved from a public DoH resolver may be unreachable from the user's ISP
 /// path. Pinning a few verified IPs gives connection fail-over headroom without
 /// bloating the hosts file.
-const MAX_PINNED_IPS_PER_DOMAIN: usize = 3;
+// Route Assist splits Roblox traffic by host, but Roblox frequently serves
+// unrelated hosts from shared CDN/edge IPs. Keeping a few extra candidates gives
+// the allocator room to avoid relaying avatar/chat/asset hosts just because they
+// share one edge with gamejoin.
+const MAX_PINNED_IPS_PER_DOMAIN: usize = 6;
 
 /// Per-IP TCP reachability probe timeout. Short so a dead edge is skipped fast;
 /// the whole repair still runs under `DNS_REPAIR_TOTAL_TIMEOUT`.
@@ -89,6 +93,14 @@ const ASSET_DIRECT_ROBLOX_DOMAINS: &[&str] = &[
     "thumbnails.roblox.com",
     "setup.roblox.com",
 ];
+
+// Route Assist only needs the region/join control plane on the relay. Roblox
+// UI/social/chat/avatar/catalog traffic has no placement value and can break
+// when it rides a shared relay NAT, showing as missing chat, empty menus, and
+// unloaded player icons. Full country-ban bypass ignores this split and relays
+// every pinned host.
+const ROUTE_ASSIST_RELAY_DOMAINS: &[&str] =
+    &["gamejoin.roblox.com", "games.roblox.com", "apis.roblox.com"];
 
 /// Exact Roblox hostnames repaired when Route Assist is enabled.
 ///
@@ -290,6 +302,10 @@ pub fn is_active_bootstrap_ip(ip: Ipv4Addr) -> bool {
         .read()
         .map(|ips| ips.contains_key(&ip))
         .unwrap_or(false)
+}
+
+pub fn is_country_ban_bypass_routing_active() -> bool {
+    COUNTRY_BAN_BYPASS_ROUTING.load(Ordering::Relaxed)
 }
 
 /// Whether `ip` is a launch-critical bootstrap IP that must stay direct
@@ -703,10 +719,26 @@ pub fn is_asset_direct_domain(domain: &str) -> bool {
         || d.to_ascii_lowercase().ends_with(".rbxcdn.com")
 }
 
-/// A domain whose IPs should go direct in the route-assist (non-country-ban)
-/// path: either a launch-critical settings host or an asset/CDN host.
+fn is_route_assist_relay_domain(domain: &str) -> bool {
+    let d = domain.trim_end_matches('.');
+    ROUTE_ASSIST_RELAY_DOMAINS
+        .iter()
+        .any(|relay| d.eq_ignore_ascii_case(relay))
+}
+
+/// Direct under Route Assist = every known Roblox helper/UI/asset host except
+/// the small region/join relay set.
 fn is_route_assist_direct_domain(domain: &str) -> bool {
-    is_direct_only_bootstrap_domain(domain) || is_asset_direct_domain(domain)
+    let d = domain.trim_end_matches('.');
+    if is_route_assist_relay_domain(d) {
+        return false;
+    }
+
+    is_direct_only_bootstrap_domain(d)
+        || is_asset_direct_domain(d)
+        || ROBLOX_BOOTSTRAP_DOMAINS
+            .iter()
+            .any(|known| d.eq_ignore_ascii_case(known))
 }
 
 /// Allocate route-assist pins: split resolved overrides into
@@ -1039,6 +1071,10 @@ mod tests {
             },
             HostOverride {
                 ip: Ipv4Addr::new(128, 116, 121, 3),
+                domain: "gamejoin.roblox.com".to_string(),
+            },
+            HostOverride {
+                ip: Ipv4Addr::new(128, 116, 121, 4),
                 domain: "www.roblox.com".to_string(),
             },
             HostOverride {
@@ -1054,9 +1090,12 @@ mod tests {
         assert!(!active.contains_key(&Ipv4Addr::new(128, 116, 46, 3)));
         assert!(direct_only.contains(&Ipv4Addr::new(65, 9, 168, 80)));
         assert!(direct_only.contains(&Ipv4Addr::new(128, 116, 46, 3)));
-        // Control-plane host → active
+        // Region/join control-plane relay host → active
         assert!(active.contains_key(&Ipv4Addr::new(128, 116, 121, 3)));
         assert!(!direct_only.contains(&Ipv4Addr::new(128, 116, 121, 3)));
+        // UI/social hosts (www.roblox.com) stay direct so menus/chat work
+        assert!(direct_only.contains(&Ipv4Addr::new(128, 116, 121, 4)));
+        assert!(!active.contains_key(&Ipv4Addr::new(128, 116, 121, 4)));
         // rbxcdn.com → direct_only (asset)
         assert!(!active.contains_key(&Ipv4Addr::new(10, 20, 30, 40)));
         assert!(direct_only.contains(&Ipv4Addr::new(10, 20, 30, 40)));
@@ -1155,7 +1194,7 @@ mod tests {
         clear_active_bootstrap_ips_for_test();
 
         let ip = Ipv4Addr::new(65, 9, 168, 91);
-        assert!(!learn_direct_only_bootstrap_ip("www.roblox.com", ip));
+        assert!(!learn_direct_only_bootstrap_ip("gamejoin.roblox.com", ip));
         assert!(!learn_direct_only_bootstrap_ip("apis.roblox.com", ip));
         assert!(!learn_direct_only_bootstrap_ip(
             "clientsettingscdn.roblox.com.evil.test",

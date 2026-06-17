@@ -35,6 +35,9 @@ pub use process_watcher::{ProcessStartEvent, ProcessWatcher};
 
 use crate::error::SdkError;
 use std::sync::Arc;
+use std::time::Duration;
+
+const WINPKFILTER_BINDING_CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Combined split tunnel driver that orchestrates all components.
 ///
@@ -269,6 +272,151 @@ impl SplitTunnelDriver {
     /// Get the current process cache snapshot.
     pub fn get_snapshot(&self) -> Arc<ProcessSnapshot> {
         self.interceptor.get_snapshot()
+    }
+}
+
+/// Run a hidden subprocess with a wall-clock timeout. Kills the child if it
+/// exceeds the timeout. Uses `CREATE_NO_WINDOW` so powershell never flashes.
+#[cfg(windows)]
+fn run_hidden_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    use std::time::Instant;
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .spawn()?;
+
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            return child.wait_with_output();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+impl SplitTunnelDriver {
+    fn build_winpkfilter_binding_cleanup_script() -> &'static str {
+        r#"
+        $ErrorActionPreference = 'Stop'
+        $bindings = @(
+            Get-NetAdapterBinding -ComponentID 'nt_ndisrd' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Enabled -eq $true } |
+                Sort-Object -Property Name -Unique
+        )
+
+        if ($bindings.Count -eq 0) {
+            Write-Output 'No enabled WinpkFilter bindings found during uninstall cleanup.'
+            exit 0
+        }
+
+        $disabled = New-Object System.Collections.Generic.List[string]
+        $failures = New-Object System.Collections.Generic.List[string]
+
+        foreach ($binding in $bindings) {
+            $adapterName = [string]$binding.Name
+            if ([string]::IsNullOrWhiteSpace($adapterName)) {
+                continue
+            }
+
+            try {
+                Disable-NetAdapterBinding -Name $adapterName -ComponentID 'nt_ndisrd' -Confirm:$false -ErrorAction Stop | Out-Null
+                Start-Sleep -Milliseconds 500
+                $verification = Get-NetAdapterBinding -Name $adapterName -ComponentID 'nt_ndisrd' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+
+                if ($verification -and $verification.Enabled) {
+                    $failures.Add($adapterName + ': binding still enabled after Disable-NetAdapterBinding')
+                    continue
+                }
+
+                $disabled.Add($adapterName)
+            } catch {
+                $failures.Add($adapterName + ': ' + $_.Exception.Message)
+            }
+        }
+
+        if ($disabled.Count -gt 0) {
+            Write-Output ('Disabled WinpkFilter binding on adapters: ' + ($disabled -join ', '))
+        }
+
+        if ($failures.Count -gt 0) {
+            Write-Error ('Failed to disable WinpkFilter binding on adapters: ' + ($failures -join '; '))
+            exit 1
+        }
+        "#
+    }
+
+    #[cfg(windows)]
+    fn parse_disabled_winpkfilter_adapters(stdout: &str) -> Vec<String> {
+        const PREFIX: &str = "Disabled WinpkFilter binding on adapters: ";
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(PREFIX))
+            .map(|rest| {
+                rest.split(',')
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Disable any leftover `nt_ndisrd` adapter bindings as part of Internet
+    /// recovery after a crash or force-close. Safe while disconnected — the next
+    /// connect re-enables the binding on the active adapter.
+    #[cfg(windows)]
+    pub fn disable_leftover_winpkfilter_bindings() -> Result<Vec<String>, String> {
+        let output = run_hidden_command_with_timeout(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                Self::build_winpkfilter_binding_cleanup_script(),
+            ],
+            WINPKFILTER_BINDING_CLEANUP_TIMEOUT,
+        )
+        .map_err(|e| format!("Failed to run WinpkFilter binding recovery: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        if !output.status.success() {
+            let details = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!(
+                    "PowerShell exited with code {}",
+                    output.status.code().unwrap_or(-1)
+                )
+            };
+            return Err(format!(
+                "Failed to disable leftover WinpkFilter adapter bindings: {}",
+                details
+            ));
+        }
+
+        let disabled = Self::parse_disabled_winpkfilter_adapters(&stdout);
+        if disabled.is_empty() {
+            log::info!("Internet recovery: no leftover WinpkFilter adapter bindings to disable");
+        } else {
+            log::info!(
+                "Internet recovery: disabled leftover WinpkFilter binding on adapter(s): {}",
+                disabled.join(", ")
+            );
+        }
+        Ok(disabled)
     }
 }
 
