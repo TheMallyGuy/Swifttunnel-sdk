@@ -214,6 +214,10 @@ pub async fn apply_bootstrap_overrides(country_ban_bypass: bool) -> Result<(), S
         enter_country_ban_routing();
     }
 
+    // In the Route Assist/Partial case, only relayed control-plane hosts are
+    // written to hosts. Direct hosts still contribute to the direct-only IP set,
+    // but they use the user's normal DNS path so stale SwiftTunnel pins cannot
+    // break Roblox app startup/home loading on Vietnam-style partial blocks.
     let resolved = resolve_bootstrap_overrides().await?;
     let (overrides, active_ips, direct_only_ips) = if country_ban_bypass {
         let (active, direct_only) = country_ban_split_ips_from_overrides(&resolved);
@@ -742,7 +746,14 @@ fn is_route_assist_direct_domain(domain: &str) -> bool {
 }
 
 /// Allocate route-assist pins: split resolved overrides into
-/// (kept overrides, active relay HashMap<ip→domain>, direct-only HashSet).
+/// (hosts-file overrides, active relay HashMap<ip→domain>, direct-only HashSet).
+///
+/// Only relayed control-plane entries are returned for hosts-file writing.
+/// Direct entries are deliberately not written: pinning direct Roblox UI,
+/// settings, chat, avatar, and asset hosts to public DoH results can send the
+/// desktop app to stale or wrong CDN/API edges on Vietnam-style networks. The
+/// direct IPs are still published into the direct-only set so the interceptor
+/// can avoid pulling those destinations into the relay when it sees them.
 ///
 /// For each domain, prefers entries whose IP is not claimed by the other pool
 /// (conflict-free). If no conflict-free entry exists for a domain, all its
@@ -804,7 +815,12 @@ fn allocate_route_assist_pins(
         .filter(|ip| !active.contains_key(ip))
         .collect();
 
-    (kept, active, direct_only)
+    let writable_overrides = kept
+        .into_iter()
+        .filter(|entry| !is_route_assist_direct_domain(&entry.domain))
+        .collect();
+
+    (writable_overrides, active, direct_only)
 }
 
 /// During country-ban bypass: relay everything — full country ban means the
