@@ -498,17 +498,21 @@ impl ParallelInterceptor {
                         || friendly_lower.contains("vpn")
                         || friendly_lower.contains("tunnel")));
 
-            if is_virtual || friendly_name.is_empty() {
+            let adapter_if_index = Self::get_adapter_interface_index(&internal_name);
+            let has_default_route = adapter_if_index.is_some()
+                && default_route_if_index.is_some()
+                && adapter_if_index == default_route_if_index;
+
+            // Keep unnamed adapters only if they carry the default route —
+            // they are likely physical adapters whose friendly-name lookup
+            // failed (e.g. GUID mismatch with GetAdaptersAddresses on some
+            // systems with VPN software layered on top).
+            if is_virtual || (friendly_name.is_empty() && !has_default_route) {
                 log::info!("    -> Skipped");
                 continue;
             }
 
             let mut score = 0i32;
-
-            let adapter_if_index = Self::get_adapter_interface_index(&internal_name);
-            let has_default_route = adapter_if_index.is_some()
-                && default_route_if_index.is_some()
-                && adapter_if_index == default_route_if_index;
 
             if has_default_route {
                 score += 1000;
@@ -604,55 +608,75 @@ impl ParallelInterceptor {
         None
     }
 
-    /// Get interface index from adapter GUID
+    /// Get interface index from adapter internal name.
+    /// Primary: GUID → LUID → IfIndex (reliable on systems where
+    /// GetAdaptersAddresses GUID matching fails, e.g. with Tailscale).
+    /// Fallback: GetAdaptersAddresses string-based GUID matching.
     #[cfg(windows)]
-    fn get_adapter_interface_index(adapter_guid: &str) -> Option<u32> {
-        use windows::Win32::NetworkManagement::IpHelper::*;
+    fn get_adapter_interface_index(adapter_internal_name: &str) -> Option<u32> {
+        use windows::Win32::NetworkManagement::IpHelper::{
+            ConvertInterfaceGuidToLuid, ConvertInterfaceLuidToIndex, GAA_FLAG_INCLUDE_PREFIX,
+            GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+        };
+        use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
         use windows::Win32::Networking::WinSock::AF_INET;
+
+        // Primary: parse GUID → LUID → IfIndex. This works even when
+        // GetAdaptersAddresses returns a different GUID representation.
+        if let Some(guid) = Self::parse_adapter_guid(adapter_internal_name) {
+            unsafe {
+                let mut luid = NET_LUID_LH::default();
+                if ConvertInterfaceGuidToLuid(&guid, &mut luid).0 == 0 {
+                    let mut if_index: u32 = 0;
+                    if ConvertInterfaceLuidToIndex(&luid, &mut if_index).0 == 0 {
+                        return Some(if_index);
+                    }
+                }
+            }
+        }
+
+        // Fallback: GetAdaptersAddresses GUID string matching.
+        let guid_lc = adapter_internal_name
+            .rsplit('\\')
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == '{' || c == '}')
+            .to_lowercase();
+
+        if guid_lc.is_empty() {
+            return None;
+        }
 
         unsafe {
             let mut size: u32 = 0;
-            let _ = GetAdaptersAddresses(
-                AF_INET.0 as u32,
-                GAA_FLAG_INCLUDE_PREFIX,
-                None,
-                None,
-                &mut size,
-            );
+            let _ = GetAdaptersAddresses(AF_INET.0 as u32, GAA_FLAG_INCLUDE_PREFIX, None, None, &mut size);
             if size == 0 {
                 return None;
             }
-
             let mut buffer = vec![0u8; size as usize];
-            let adapter_addresses = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
-
-            if GetAdaptersAddresses(
-                AF_INET.0 as u32,
-                GAA_FLAG_INCLUDE_PREFIX,
-                None,
-                Some(adapter_addresses),
-                &mut size,
-            ) != 0
-            {
+            let ptr = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+            if GetAdaptersAddresses(AF_INET.0 as u32, GAA_FLAG_INCLUDE_PREFIX, None, Some(ptr), &mut size) != 0 {
                 return None;
             }
-
-            let mut current = adapter_addresses;
+            let mut current = ptr;
             while !current.is_null() {
                 let adapter = &*current;
                 let name = adapter.AdapterName.to_string().unwrap_or_default();
-                let guid_from_adapter = adapter_guid.trim_start_matches("\\DEVICE\\");
-                if guid_from_adapter == name
-                    || guid_from_adapter.trim_matches('{').trim_matches('}')
-                        == name.trim_matches('{').trim_matches('}')
-                {
+                if name.trim_matches(|c| c == '{' || c == '}').to_lowercase() == guid_lc {
                     return Some(adapter.Anonymous1.Anonymous.IfIndex);
                 }
                 current = adapter.Next;
             }
         }
-
         None
+    }
+
+    /// Parse a Windows GUID from an ndisapi internal adapter name like
+    /// `\DEVICE\{57D5A8AE-A8C2-4514-B685-37A116AD0B49}`.
+    #[cfg(windows)]
+    fn parse_adapter_guid(internal_name: &str) -> Option<windows::core::GUID> {
+        let s = internal_name.rsplit('\\').next().unwrap_or(internal_name);
+        windows::core::GUID::try_from(s).ok()
     }
 
     #[cfg(not(windows))]
