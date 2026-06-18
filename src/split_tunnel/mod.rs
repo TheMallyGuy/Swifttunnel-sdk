@@ -308,9 +308,15 @@ impl SplitTunnelDriver {
     fn build_winpkfilter_binding_cleanup_script() -> &'static str {
         r#"
         $ErrorActionPreference = 'Stop'
+        # Skip the adapter carrying the default route — it needs the binding to
+        # stay attached so ndisapi can see and bind to it on the next connect.
+        $defaultRouteAlias = try {
+            (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias
+        } catch { $null }
         $bindings = @(
             Get-NetAdapterBinding -ComponentID 'nt_ndisrd' -ErrorAction SilentlyContinue |
-                Where-Object { $_.Enabled -eq $true } |
+                Where-Object { $_.Enabled -eq $true -and $_.Name -ne $defaultRouteAlias } |
                 Sort-Object -Property Name -Unique
         )
 
@@ -369,6 +375,32 @@ impl SplitTunnelDriver {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Ensure the default-route adapter has the nt_ndisrd LWF binding enabled
+    /// so ndisapi can enumerate it. Returns true if the binding was enabled.
+    #[cfg(windows)]
+    pub fn ensure_default_route_adapter_binding() -> Result<bool, String> {
+        let script = r#"
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Sort-Object RouteMetric | Select-Object -First 1
+        if (-not $route) { exit 0 }
+        $alias = $route.InterfaceAlias
+        $binding = Get-NetAdapterBinding -Name $alias -ComponentID 'nt_ndisrd' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($binding -and -not $binding.Enabled) {
+            Enable-NetAdapterBinding -Name $alias -ComponentID 'nt_ndisrd' -ErrorAction SilentlyContinue
+            Write-Output "Enabled nt_ndisrd on $alias"
+        }
+        "#;
+        let output = run_hidden_command_with_timeout(
+            "powershell",
+            &["-NoProfile", "-Command", script],
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|e| format!("ensure binding: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(stdout.starts_with("Enabled"))
     }
 
     /// Disable any leftover `nt_ndisrd` adapter bindings as part of Internet

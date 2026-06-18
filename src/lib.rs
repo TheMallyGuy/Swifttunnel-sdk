@@ -973,6 +973,17 @@ pub extern "C" fn swifttunnel_startup_prepare() -> i32 {
             Ok(_) => {}
             Err(e) => log::warn!("Startup prepare: WinpkFilter binding cleanup failed: {e}"),
         }
+        // Ensure the default-route adapter's binding is active so ndisapi can
+        // enumerate it. The cleanup above preserves it, but if it was already
+        // disabled before our first run, re-enable it here.
+        match crate::split_tunnel::SplitTunnelDriver::ensure_default_route_adapter_binding() {
+            Ok(enabled) => {
+                if enabled {
+                    log::info!("Startup prepare: enabled nt_ndisrd binding on default-route adapter");
+                }
+            }
+            Err(e) => log::warn!("Startup prepare: nt_ndisrd binding check failed: {e}"),
+        }
     }
 
     if crate::split_tunnel::SplitTunnelDriver::check_driver_available() {
