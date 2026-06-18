@@ -205,6 +205,13 @@ char *swifttunnel_get_auto_routing_json(void);
 int32_t swifttunnel_refresh_processes(void);
 
 /**
+ * Run startup preparation before connecting: clears any leftover WinpkFilter
+ * adapter bindings from a prior crash and checks that the split-tunnel driver
+ * is available. Returns 1 if the driver is ready, 0 if unavailable.
+ */
+int32_t swifttunnel_startup_prepare(void);
+
+/**
  * Register a callback for VPN state changes.
  *
  * Signature: `fn(state_code: i32, user_context: *mut c_void)`
