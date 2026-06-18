@@ -1,5 +1,9 @@
 pub const ROBLOX_PROCESS_NAMES: &[&str] = &[
     "robloxplayerbeta.exe",
+    // Newer Roblox installations (post-2024) use RobloxPlayer.exe
+    "robloxplayer.exe",
+    // Microsoft Store / UWP version
+    "robloxapp.exe",
     "robloxplayerlauncher.exe",
     "robloxcrashhandler.exe",
     "robloxstudiolauncher.exe",
