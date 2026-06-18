@@ -460,6 +460,7 @@ impl ParallelInterceptor {
             let internal_name = adapter.get_name();
             let friendly_name = get_adapter_friendly_name(&internal_name)
                 .or_else(|| get_adapter_friendly_name_v2(&internal_name))
+                .or_else(|| get_adapter_friendly_name_v3(&internal_name))
                 .unwrap_or_default();
 
             log::info!(
@@ -2539,5 +2540,40 @@ fn get_adapter_friendly_name_v2(internal_name: &str) -> Option<String> {
 
 #[cfg(not(windows))]
 fn get_adapter_friendly_name_v2(_internal_name: &str) -> Option<String> {
+    None
+}
+
+/// Get adapter connection name from the Windows registry using the NDIS GUID.
+/// Works when GetAdaptersInfo/GetAdaptersAddresses GUID matching fails (e.g. with
+/// layered VPN drivers like Tailscale).
+/// Key: HKLM\SYSTEM\CurrentControlSet\Control\Network\{4D36E972-...}\{GUID}\Connection\Name
+#[cfg(windows)]
+fn get_adapter_friendly_name_v3(internal_name: &str) -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let guid = internal_name
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '{' || c == '}');
+
+    if guid.is_empty() {
+        return None;
+    }
+
+    let key_path = format!(
+        "SYSTEM\\CurrentControlSet\\Control\\Network\\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\\{{{}}}\\Connection",
+        guid
+    );
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let connection_key = hklm.open_subkey(&key_path).ok()?;
+    let name: String = connection_key.get_value("Name").ok()?;
+    if name.is_empty() { None } else { Some(name) }
+}
+
+#[cfg(not(windows))]
+fn get_adapter_friendly_name_v3(_internal_name: &str) -> Option<String> {
     None
 }
