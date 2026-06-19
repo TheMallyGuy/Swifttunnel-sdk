@@ -146,7 +146,7 @@ async fn authenticate_relay_handshake(
         tokio::task::spawn_blocking(move || relay_for_auth.authenticate_with_ticket(&token)).await;
 
     match handshake {
-        Ok(Ok(Some(super::relay::RelayAuthAckStatus::Ok))) => {
+        Ok(Ok(Some(status))) if status.is_authenticated() => {
             log::info!("Relay authenticated (session {}, region {})", session_id_hex, region);
             "authenticated".to_string()
         }
@@ -1025,16 +1025,6 @@ impl VpnConnection {
             guard.close();
         }
         self.split_tunnel = None;
-
-        #[cfg(windows)]
-        match crate::split_tunnel::SplitTunnelDriver::disable_leftover_winpkfilter_bindings() {
-            Ok(disabled) if !disabled.is_empty() => log::info!(
-                "Disconnect cleanup: disabled WinpkFilter binding on adapter(s): {}",
-                disabled.join(", ")
-            ),
-            Ok(_) => {}
-            Err(e) => log::warn!("Disconnect cleanup: WinpkFilter binding cleanup failed: {e}"),
-        }
 
         // Drop any user URL exclusions.
         crate::exclusions::clear();

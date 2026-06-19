@@ -74,14 +74,26 @@ fn last_applied_overrides() -> &'static RwLock<Vec<HostOverride>> {
 /// that routing decision.
 static COUNTRY_BAN_BYPASS_ROUTING: AtomicBool = AtomicBool::new(false);
 
-// Keep DNS repair for these launch-critical hosts, but do not publish their IPs
-// to Route Assist. Roblox can fail startup with "Failed to download or apply
-// critical settings" if these bootstrap HTTPS requests are relayed unreliably.
+// Launch-critical + sign-in-critical hosts that must stay DIRECT under Route
+// Assist / Partial bypass and are important enough to PIN back into the Windows
+// hosts file (see `allocate_route_assist_pins`), so the OS resolves them to our
+// de-conflicted, reachability-verified direct edge instead of whatever the
+// user's resolver hands out.
+//
+//   - `clientsettings*` / `versioncompatibility`: Roblox fails startup with
+//     "Failed to download or apply critical settings" if these one-shot
+//     bootstrap HTTPS fetches are relayed unreliably.
+//   - `auth.roblox.com`: a fresh sign-in routed out a relay's foreign datacenter
+//     IP trips Roblox's new-location/geo login defenses (FunCaptcha, 2SV,
+//     suspicious-login soft-block). Already-authenticated sessions don't re-auth,
+//     so the breakage is sign-in-only. Relaying it is only correct under FULL
+//     country-ban bypass; that path never calls `allocate_route_assist_pins`.
 const DIRECT_ONLY_BOOTSTRAP_DOMAINS: &[&str] = &[
     "clientsettingscdn.roblox.com",
     "clientsettings.roblox.com",
     "clientsettings.api.roblox.com",
     "versioncompatibility.api.roblox.com",
+    "auth.roblox.com",
 ];
 
 /// Asset/CDN domains that should go direct (not through the relay) when a
@@ -815,9 +827,18 @@ fn allocate_route_assist_pins(
         .filter(|ip| !active.contains_key(ip))
         .collect();
 
+    // Write the relayed control-plane pins, PLUS launch-critical settings + auth
+    // hosts at a de-conflicted direct IP (one that survived into `direct_only`,
+    // so never a relayed edge). The broad UI/asset direct set is left to the
+    // user's DNS so stale pins don't break Roblox UI on Vietnam-style networks.
     let writable_overrides = kept
-        .into_iter()
-        .filter(|entry| !is_route_assist_direct_domain(&entry.domain))
+        .iter()
+        .filter(|entry| {
+            !is_route_assist_direct_domain(&entry.domain)
+                || (is_direct_only_bootstrap_domain(&entry.domain)
+                    && direct_only.contains(&entry.ip))
+        })
+        .cloned()
         .collect();
 
     (writable_overrides, active, direct_only)

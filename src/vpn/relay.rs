@@ -38,6 +38,9 @@ pub enum RelayAuthAckStatus {
     SidMismatch = 4,
     ServerMismatch = 5,
     AuthDisabled = 6,
+    /// Relay rejected this ticket's `jti` as a replay (already seen until
+    /// expiry). Always a rejection — never coerced to `Ok`.
+    Replay = 7,
 }
 
 impl RelayAuthAckStatus {
@@ -50,6 +53,7 @@ impl RelayAuthAckStatus {
             4 => Some(Self::SidMismatch),
             5 => Some(Self::ServerMismatch),
             6 => Some(Self::AuthDisabled),
+            7 => Some(Self::Replay),
             _ => None,
         }
     }
@@ -63,7 +67,13 @@ impl RelayAuthAckStatus {
             Self::SidMismatch => "sid_mismatch",
             Self::ServerMismatch => "server_mismatch",
             Self::AuthDisabled => "auth_disabled",
+            Self::Replay => "replay",
         }
+    }
+
+    /// Only `Ok` authenticates the session. Every other status is a rejection.
+    pub fn is_authenticated(self) -> bool {
+        matches!(self, Self::Ok)
     }
 }
 
@@ -549,10 +559,11 @@ impl UdpRelay {
         Ok(None)
     }
 
-    /// Send the relay auth-hello and wait for an ack.
+    /// Send relay auth hello and wait for ack, with real retransmits.
     ///
-    /// Retries up to [`AUTH_HANDSHAKE_ATTEMPTS`] times within a total
-    /// [`AUTH_HANDSHAKE_TOTAL_TIMEOUT`] budget. Returns `Ok(None)` on timeout.
+    /// Up to `AUTH_HANDSHAKE_ATTEMPTS` hellos within `AUTH_HANDSHAKE_TOTAL_TIMEOUT`.
+    /// Early attempts listen one `AUTH_HANDSHAKE_RETRY_DELAY` then retransmit;
+    /// the final attempt listens out the remaining budget for high-RTT links.
     pub fn authenticate_with_ticket(
         &self,
         token: &str,
@@ -560,18 +571,23 @@ impl UdpRelay {
         let deadline = Instant::now() + AUTH_HANDSHAKE_TOTAL_TIMEOUT;
 
         for attempt in 0..AUTH_HANDSHAKE_ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(AUTH_HANDSHAKE_RETRY_DELAY);
-            }
-
-            self.send_auth_hello(token)?;
-
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
 
-            if let Some(status) = self.wait_for_auth_ack(remaining)? {
+            self.send_auth_hello(token)?;
+
+            // Early attempts use a short window so retransmit actually fires;
+            // the last attempt consumes the remaining budget for slow links.
+            let is_last_attempt = attempt + 1 == AUTH_HANDSHAKE_ATTEMPTS;
+            let attempt_timeout = if is_last_attempt {
+                remaining
+            } else {
+                AUTH_HANDSHAKE_RETRY_DELAY.min(remaining)
+            };
+
+            if let Some(status) = self.wait_for_auth_ack(attempt_timeout)? {
                 log::info!(
                     "UDP Relay: Auth ack {} for session {:016x}",
                     status.as_str(),
