@@ -111,8 +111,13 @@ const ASSET_DIRECT_ROBLOX_DOMAINS: &[&str] = &[
 // when it rides a shared relay NAT, showing as missing chat, empty menus, and
 // unloaded player icons. Full country-ban bypass ignores this split and relays
 // every pinned host.
-const ROUTE_ASSIST_RELAY_DOMAINS: &[&str] =
-    &["gamejoin.roblox.com", "games.roblox.com", "apis.roblox.com"];
+const ROUTE_ASSIST_RELAY_DOMAINS: &[&str] = &[
+    "gamejoin.roblox.com",
+    "games.roblox.com",
+    // Roblox latency measurement influences placement. Keep it on the relay so
+    // Route Assist measures the selected tunnel path instead of the user's ISP.
+    "lms.roblox.com",
+];
 
 /// Exact Roblox hostnames repaired when Route Assist is enabled.
 ///
@@ -133,11 +138,18 @@ pub const ROBLOX_BOOTSTRAP_DOMAINS: &[&str] = &[
     "accountinformation.roblox.com",
     "users.roblox.com",
     "avatar.roblox.com",
+    "badges.roblox.com",
     "catalog.roblox.com",
+    "contacts.roblox.com",
     "inventory.roblox.com",
     "economy.roblox.com",
+    "followings.roblox.com",
+    "gameinternationalization.roblox.com",
     "games.roblox.com",
     "gamejoin.roblox.com",
+    "groups.roblox.com",
+    "lms.roblox.com",
+    "notifications.roblox.com",
     "assetgame.roblox.com",
     "assetdelivery.roblox.com",
     "thumbnails.roblox.com",
@@ -173,7 +185,10 @@ pub const ROBLOX_BOOTSTRAP_DOMAINS: &[&str] = &[
     "images.rbxcdn.com",
     "css.rbxcdn.com",
     "cdn.arkoselabs.com",
+    "client-api.arkoselabs.com",
     "roblox-api.arkoselabs.com",
+    "roblox-verify.arkoselabs.com",
+    "status.arkoselabs.com",
 ];
 
 fn hosts_path() -> PathBuf {
@@ -1036,7 +1051,7 @@ mod tests {
 
     #[test]
     fn domain_list_stays_allowlisted_and_exact() {
-        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 54);
+        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 64);
         assert!(!ROBLOX_BOOTSTRAP_DOMAINS.contains(&"roblox.com"));
         assert!(ROBLOX_BOOTSTRAP_DOMAINS.contains(&"gamejoin.roblox.com"));
         // c0-c7 must be in bootstrap domains
@@ -1232,7 +1247,7 @@ mod tests {
 
         let ip = Ipv4Addr::new(65, 9, 168, 91);
         assert!(!learn_direct_only_bootstrap_ip("gamejoin.roblox.com", ip));
-        assert!(!learn_direct_only_bootstrap_ip("apis.roblox.com", ip));
+        assert!(!learn_direct_only_bootstrap_ip("lms.roblox.com", ip));
         assert!(!learn_direct_only_bootstrap_ip(
             "clientsettingscdn.roblox.com.evil.test",
             ip

@@ -25,7 +25,7 @@ const RESOLVE_MAX_HOSTS_PER_REQUEST: usize = 16;
 const RESOLVE_MAX_HOSTNAME_LEN: usize = 64;
 
 const AUTH_HANDSHAKE_TOTAL_TIMEOUT: Duration = Duration::from_millis(1500);
-const AUTH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const AUTH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(500);
 const AUTH_HANDSHAKE_ATTEMPTS: usize = 4;
 
 /// Status returned by the relay in an auth-ack frame.
