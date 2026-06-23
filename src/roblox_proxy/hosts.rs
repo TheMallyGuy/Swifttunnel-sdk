@@ -106,6 +106,18 @@ const ASSET_DIRECT_ROBLOX_DOMAINS: &[&str] = &[
     "setup.roblox.com",
 ];
 
+// Asset entrypoints worth pinning direct under Route Assist
+// when DNS repair finds a de-conflicted IP. These are small in number and sit
+// in front of most `rbxassetid://` textures, sounds, animations, and thumbnails.
+// Keeping them on user DNS alone lets Windows pick a Roblox edge that is also
+// pinned for the relayed join/control plane; that pushes bulk asset requests
+// through the shared relay NAT and can trigger Roblox HTTP 429 throttling.
+const PINNED_ASSET_DIRECT_ROBLOX_DOMAINS: &[&str] = &[
+    "assetdelivery.roblox.com",
+    "assetgame.roblox.com",
+    "thumbnails.roblox.com",
+];
+
 // Route Assist only needs the region/join control plane on the relay. Roblox
 // UI/social/chat/avatar/catalog traffic has no placement value and can break
 // when it rides a shared relay NAT, showing as missing chat, empty menus, and
@@ -740,6 +752,17 @@ fn is_direct_only_bootstrap_domain(domain: &str) -> bool {
         .any(|d| domain.eq_ignore_ascii_case(d))
 }
 
+fn is_pinned_asset_direct_domain(domain: &str) -> bool {
+    let d = domain.trim_end_matches('.');
+    PINNED_ASSET_DIRECT_ROBLOX_DOMAINS
+        .iter()
+        .any(|asset| d.eq_ignore_ascii_case(asset))
+}
+
+fn is_pinned_route_assist_direct_domain(domain: &str) -> bool {
+    is_direct_only_bootstrap_domain(domain) || is_pinned_asset_direct_domain(domain)
+}
+
 /// Whether `domain` is an asset/CDN host that goes direct (high-bandwidth, no
 /// need for relay escape). Named roblox.com asset hosts plus any *.rbxcdn.com.
 pub fn is_asset_direct_domain(domain: &str) -> bool {
@@ -842,15 +865,16 @@ fn allocate_route_assist_pins(
         .filter(|ip| !active.contains_key(ip))
         .collect();
 
-    // Write the relayed control-plane pins, PLUS launch-critical settings + auth
-    // hosts at a de-conflicted direct IP (one that survived into `direct_only`,
-    // so never a relayed edge). The broad UI/asset direct set is left to the
-    // user's DNS so stale pins don't break Roblox UI on Vietnam-style networks.
+    // Write the relayed control-plane pins, plus launch-critical/auth pins and
+    // the main asset entrypoints at a de-conflicted direct IP (one that survived
+    // into `direct_only`, so never a relayed edge). Broad UI/social hosts and
+    // wildcard CDN shards stay on the user's DNS; pinning only these asset
+    // entrypoints avoids shared-relay 429s without chasing every CDN hostname.
     let writable_overrides = kept
         .iter()
         .filter(|entry| {
             !is_route_assist_direct_domain(&entry.domain)
-                || (is_direct_only_bootstrap_domain(&entry.domain)
+                || (is_pinned_route_assist_direct_domain(&entry.domain)
                     && direct_only.contains(&entry.ip))
         })
         .cloned()
