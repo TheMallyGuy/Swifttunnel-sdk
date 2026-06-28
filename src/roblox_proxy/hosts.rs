@@ -169,6 +169,8 @@ pub const ROBLOX_BOOTSTRAP_DOMAINS: &[&str] = &[
     "friends.roblox.com",
     "chat.roblox.com",
     "chatsite.roblox.com",
+    "pulsar.roblox.com",
+    "silver.roblox.com",
     "locale.roblox.com",
     "setup.roblox.com",
     "captcha.roblox.com",
@@ -196,11 +198,15 @@ pub const ROBLOX_BOOTSTRAP_DOMAINS: &[&str] = &[
     "t7.rbxcdn.com",
     "images.rbxcdn.com",
     "css.rbxcdn.com",
+    "arkoselabs.roblox.com",
     "cdn.arkoselabs.com",
+    "client.arkoselabs.com",
     "client-api.arkoselabs.com",
+    "iframe.arkoselabs.com",
     "roblox-api.arkoselabs.com",
     "roblox-verify.arkoselabs.com",
     "status.arkoselabs.com",
+    "verify.arkoselabs.com",
 ];
 
 fn hosts_path() -> PathBuf {
@@ -1075,7 +1081,7 @@ mod tests {
 
     #[test]
     fn domain_list_stays_allowlisted_and_exact() {
-        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 64);
+        assert_eq!(ROBLOX_BOOTSTRAP_DOMAINS.len(), 70);
         assert!(!ROBLOX_BOOTSTRAP_DOMAINS.contains(&"roblox.com"));
         assert!(ROBLOX_BOOTSTRAP_DOMAINS.contains(&"gamejoin.roblox.com"));
         // c0-c7 must be in bootstrap domains
